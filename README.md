@@ -112,3 +112,19 @@ while True:
     iteration += 1
     table.hand_history_enabled = False
 ```
+
+## Self-play training bot (RTX 3070 ready)
+A reference self-play trainer is included in `self_play_train.py`.
+
+It trains a hero policy against a pool of older snapshots of itself (plus a random baseline),
+which is a simple and practical way to improve through self-play.
+
+```bash
+pip install torch
+python self_play_train.py --hands 200000 --snapshot-interval 500 --output models/nlhe_self_play.pt
+```
+
+Notes:
+- The script automatically uses CUDA when available, so your RTX 3070 will be used by default.
+- Use `--cpu` if you want to force CPU training.
+- The output is a PyTorch state dict that you can later load for evaluation or deployment.
