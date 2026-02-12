@@ -92,6 +92,7 @@ class Table(gym.Env):
                 self._change_bet_to_match(1)
                 self.last_bet_placed_by = player
                 self._write_event("%s: posts big blind $%.2f" % (player.name, BB))
+        self._set_next_player_for_street()
         if self.hand_history_enabled:
             self._write_hole_cards()
         return self._get_observation(self.players[self.next_player_i])
@@ -220,6 +221,7 @@ class Table(gym.Env):
     def _street_transition(self, transition_to_end=False):
         transitioned = False
         if self.street == GameState.PREFLOP:
+            self.deck.draw(1)  # burn
             self.cards = self.deck.draw(3)
             self._write_event("*** FLOP *** [%s %s %s]" %
                               (Card.int_to_str(self.cards[0]), Card.int_to_str(self.cards[1]),
@@ -227,6 +229,7 @@ class Table(gym.Env):
             self.street = GameState.FLOP
             transitioned = True
         if self.street == GameState.FLOP and (not transitioned or transition_to_end):
+            self.deck.draw(1)  # burn
             new = self.deck.draw(1)[0]
             self.cards.append(new)
             self._write_event("*** TURN *** [%s %s %s] [%s]" %
@@ -235,6 +238,7 @@ class Table(gym.Env):
             self.street = GameState.TURN
             transitioned = True
         if self.street == GameState.TURN and (not transitioned or transition_to_end):
+            self.deck.draw(1)  # burn
             new = self.deck.draw(1)[0]
             self.cards.append(new)
             self._write_event("*** RIVER *** [%s %s %s %s] [%s]" %
@@ -255,6 +259,27 @@ class Table(gym.Env):
         self.minimum_raise = 0
         for player in self.players:
             player.finish_street()
+        if not self.hand_is_over:
+            self._set_next_player_for_street()
+
+    def _next_active_from(self, start_idx):
+        for offset in range(self.n_players):
+            idx = (start_idx + offset) % self.n_players
+            candidate = self.players[idx]
+            if candidate.state is PlayerState.ACTIVE and not candidate.all_in:
+                return idx
+        return None
+
+    def _set_next_player_for_street(self):
+        # Preflop first action: HU -> SB (button), 3+ players -> seat after BB (UTG).
+        if self.street == GameState.PREFLOP:
+            start_idx = 0 if self.n_players == 2 else 2
+        else:
+            # Postflop first action: HU -> BB (non-button), 3+ players -> SB.
+            start_idx = 1 if self.n_players == 2 else 0
+        next_idx = self._next_active_from(start_idx)
+        if next_idx is not None:
+            self.next_player_i = next_idx
 
     def _change_bet_to_match(self, new_amount):
         self.minimum_raise = new_amount - self.bet_to_match
