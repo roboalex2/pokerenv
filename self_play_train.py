@@ -16,6 +16,7 @@ import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, List
 
 import numpy as np
@@ -206,6 +207,34 @@ def _cpu_state_dict(module: nn.Module) -> dict:
     # Serialize as NumPy to avoid PyTorch FD-based tensor sharing overhead
     # when dispatching many multiprocessing tasks.
     return {k: v.detach().cpu().numpy() for k, v in module.state_dict().items()}
+
+
+def _build_checkpoint(
+    advantage_nets: List[AdvantageNet],
+    advantage_opts: List[torch.optim.Optimizer],
+    strategy_net: StrategyNet,
+    strategy_opt: torch.optim.Optimizer,
+    bet_fractions: List[float],
+    args,
+    iteration: int,
+) -> dict:
+    return {
+        "iteration": iteration,
+        "advantage_nets": [net.state_dict() for net in advantage_nets],
+        "advantage_opts": [opt.state_dict() for opt in advantage_opts],
+        "strategy_net": strategy_net.state_dict(),
+        "strategy_opt": strategy_opt.state_dict(),
+        "bet_fractions": bet_fractions,
+        "players": args.players,
+        "hidden_size": args.hidden_size,
+        "num_blocks": args.num_blocks,
+        "dropout": args.dropout,
+    }
+
+
+def _iteration_checkpoint_path(base_output: str, iteration: int) -> str:
+    base = Path(base_output)
+    return str(base.with_name(f"{base.stem}_iter{iteration:04d}{base.suffix}"))
 
 
 def _run_traversal_worker(
@@ -474,8 +503,39 @@ def train(args):
 
     regret_buffers = [ReservoirBuffer(args.regret_buffer_capacity, rng) for _ in range(args.players)]
     strategy_buffer = ReservoirBuffer(args.strategy_buffer_capacity, rng)
+    start_iteration = 1
 
-    for iteration in range(1, args.iterations + 1):
+    if args.resume_from:
+        checkpoint = torch.load(args.resume_from, map_location=device)
+        ckpt_players = int(checkpoint.get("players", args.players))
+        if ckpt_players != args.players:
+            raise ValueError(
+                f"--players ({args.players}) does not match checkpoint players ({ckpt_players}) in {args.resume_from}"
+            )
+        ckpt_bets = list(checkpoint.get("bet_fractions", bet_fractions))
+        if ckpt_bets != bet_fractions:
+            raise ValueError(
+                f"--bet-fractions ({bet_fractions}) does not match checkpoint bet_fractions ({ckpt_bets})"
+            )
+        advantage_states = checkpoint["advantage_nets"]
+        if len(advantage_states) != len(advantage_nets):
+            raise ValueError("Checkpoint advantage_nets count does not match current player count.")
+
+        for i in range(args.players):
+            advantage_nets[i].load_state_dict(advantage_states[i])
+        strategy_net.load_state_dict(checkpoint["strategy_net"])
+
+        if "advantage_opts" in checkpoint and len(checkpoint["advantage_opts"]) == len(advantage_opts):
+            for i in range(args.players):
+                advantage_opts[i].load_state_dict(checkpoint["advantage_opts"][i])
+        if "strategy_opt" in checkpoint:
+            strategy_opt.load_state_dict(checkpoint["strategy_opt"])
+
+        loaded_iter = int(checkpoint.get("iteration", 0))
+        start_iteration = loaded_iter + 1
+        print(f"Resumed from {args.resume_from} at iteration={loaded_iter}. Continuing at iteration={start_iteration}.")
+
+    for iteration in range(start_iteration, args.iterations + 1):
         iter_start = time.perf_counter()
         if args.log_phase_timing:
             print(f"[iter {iteration}] start")
@@ -603,15 +663,30 @@ def train(args):
                 f"time_s(total={iter_s:.1f}, traversals={traversals_s:.1f}, adv={adv_s:.1f}, strategy={strat_s:.1f})"
             )
 
-    checkpoint = {
-        "advantage_nets": [net.state_dict() for net in advantage_nets],
-        "strategy_net": strategy_net.state_dict(),
-        "bet_fractions": bet_fractions,
-        "players": args.players,
-        "hidden_size": args.hidden_size,
-        "num_blocks": args.num_blocks,
-        "dropout": args.dropout,
-    }
+        if args.save_every > 0 and iteration % args.save_every == 0:
+            ckpt = _build_checkpoint(
+                advantage_nets=advantage_nets,
+                advantage_opts=advantage_opts,
+                strategy_net=strategy_net,
+                strategy_opt=strategy_opt,
+                bet_fractions=bet_fractions,
+                args=args,
+                iteration=iteration,
+            )
+            periodic_path = _iteration_checkpoint_path(args.output, iteration)
+            torch.save(ckpt, periodic_path)
+            torch.save(ckpt, args.output)
+            print(f"Saved periodic checkpoint to {periodic_path} (and updated {args.output})")
+
+    checkpoint = _build_checkpoint(
+        advantage_nets=advantage_nets,
+        advantage_opts=advantage_opts,
+        strategy_net=strategy_net,
+        strategy_opt=strategy_opt,
+        bet_fractions=bet_fractions,
+        args=args,
+        iteration=max(start_iteration - 1, args.iterations),
+    )
     torch.save(checkpoint, args.output)
     print(f"Saved Deep CFR checkpoint to {args.output}")
 
@@ -675,6 +750,18 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--output", type=str, default="deep_cfr_checkpoint.pt", help="Path for the trained checkpoint")
+    parser.add_argument(
+        "--save-every",
+        type=int,
+        default=10,
+        help="Save periodic checkpoints every N iterations (0 disables periodic saves)",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default="",
+        help="Resume training from an existing checkpoint path",
+    )
     parser.add_argument("--cpu", action="store_true", help="Force CPU training")
     return parser.parse_args()
 
