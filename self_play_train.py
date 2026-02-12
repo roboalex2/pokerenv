@@ -32,6 +32,7 @@ from pokerenv.table import Table
 
 
 OBS_SIZE = 58
+_WORKER_TORCH_THREADS_CONFIGURED = False
 
 
 @dataclass(frozen=True)
@@ -258,8 +259,17 @@ def _run_traversal_worker(
     rule_mc_samples: int,
 ):
     # Keep each worker single-threaded to avoid oversubscription when many workers run.
-    torch.set_num_threads(1)
-    torch.set_num_interop_threads(1)
+    global _WORKER_TORCH_THREADS_CONFIGURED
+    if not _WORKER_TORCH_THREADS_CONFIGURED:
+        try:
+            torch.set_num_threads(1)
+        except RuntimeError:
+            pass
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
+        _WORKER_TORCH_THREADS_CONFIGURED = True
     device = torch.device("cpu")
     rng = np.random.default_rng(worker_seed)
 
