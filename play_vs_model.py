@@ -210,9 +210,15 @@ def load_model(
     seed: int,
 ) -> Tuple[StrategyNet, ActionAbstraction, np.random.Generator]:
     checkpoint = torch.load(checkpoint_path, map_location=device)
+    ckpt_obs_size = int(checkpoint.get("obs_size", OBS_SIZE))
+    if ckpt_obs_size != OBS_SIZE:
+        raise ValueError(
+            f"Checkpoint obs_size ({ckpt_obs_size}) does not match current environment obs_size ({OBS_SIZE})."
+        )
     bet_fractions = checkpoint["bet_fractions"]
     players = int(checkpoint.get("players", 6))
     hidden_size = int(checkpoint["hidden_size"])
+    history_hidden = int(checkpoint.get("history_hidden", 128))
     num_blocks = int(checkpoint["num_blocks"])
     dropout = float(checkpoint["dropout"])
 
@@ -221,6 +227,7 @@ def load_model(
         OBS_SIZE,
         abstraction.n_actions,
         hidden_size=hidden_size,
+        history_hidden=history_hidden,
         num_blocks=num_blocks,
         dropout=dropout,
     ).to(device)

@@ -31,7 +31,10 @@ from pokerenv.rule_based_player import RuleBasedPlayer, RuleBotConfig
 from pokerenv.table import Table
 
 
-OBS_SIZE = 58
+OBS_SIZE = indices.OBS_SIZE
+BASE_STATE_SIZE = indices.BASE_OBS_SIZE
+HISTORY_LEN = indices.HISTORY_LEN
+HISTORY_EVENT_SIZE = indices.HISTORY_EVENT_SIZE
 _WORKER_TORCH_THREADS_CONFIGURED = False
 
 
@@ -111,12 +114,35 @@ class ResidualBlock(nn.Module):
 
 
 class DeepCFRBackbone(nn.Module):
-    """Residual MLP encoder for poker information-state features."""
+    """History-aware encoder: state MLP + GRU action-history encoder."""
 
-    def __init__(self, obs_size: int, hidden_size: int, num_blocks: int, dropout: float):
+    def __init__(
+        self,
+        obs_size: int,
+        hidden_size: int,
+        history_hidden: int,
+        num_blocks: int,
+        dropout: float,
+    ):
         super().__init__()
-        self.input_proj = nn.Sequential(
-            nn.Linear(obs_size, hidden_size),
+        expected_obs = BASE_STATE_SIZE + HISTORY_LEN * HISTORY_EVENT_SIZE
+        if obs_size != expected_obs:
+            raise ValueError(f"obs_size={obs_size} does not match expected {expected_obs}")
+
+        self.state_proj = nn.Sequential(
+            nn.Linear(BASE_STATE_SIZE, hidden_size),
+            nn.GELU(),
+            nn.LayerNorm(hidden_size),
+        )
+        self.history_gru = nn.GRU(
+            input_size=HISTORY_EVENT_SIZE,
+            hidden_size=history_hidden,
+            batch_first=True,
+        )
+        self.history_proj = nn.Linear(history_hidden, hidden_size)
+        self.history_norm = nn.LayerNorm(hidden_size)
+        self.fuse = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
             nn.GELU(),
             nn.LayerNorm(hidden_size),
         )
@@ -124,16 +150,40 @@ class DeepCFRBackbone(nn.Module):
         self.out_norm = nn.LayerNorm(hidden_size)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        x = self.input_proj(obs)
+        state = obs[:, :BASE_STATE_SIZE]
+        history_flat = obs[:, BASE_STATE_SIZE:OBS_SIZE]
+        history = history_flat.view(-1, HISTORY_LEN, HISTORY_EVENT_SIZE)
+
+        state_feat = self.state_proj(state)
+
+        history_valid = history[:, :, 0]
+        history_lengths = history_valid.sum(dim=1).long()
+        gru_out, _ = self.history_gru(history)
+        # History is left-padded in observation construction, so the latest event
+        # is always at the final timestep whenever history exists.
+        history_last = gru_out[:, -1, :]
+        has_history = (history_lengths > 0).float().unsqueeze(1)
+        history_last = history_last * has_history
+
+        history_feat = self.history_norm(F.gelu(self.history_proj(history_last)))
+        x = self.fuse(torch.cat([state_feat, history_feat], dim=-1))
         for block in self.blocks:
             x = block(x)
         return self.out_norm(x)
 
 
 class AdvantageNet(nn.Module):
-    def __init__(self, obs_size: int, n_actions: int, hidden_size: int, num_blocks: int, dropout: float):
+    def __init__(
+        self,
+        obs_size: int,
+        n_actions: int,
+        hidden_size: int,
+        history_hidden: int,
+        num_blocks: int,
+        dropout: float,
+    ):
         super().__init__()
-        self.backbone = DeepCFRBackbone(obs_size, hidden_size, num_blocks, dropout)
+        self.backbone = DeepCFRBackbone(obs_size, hidden_size, history_hidden, num_blocks, dropout)
         self.head = nn.Linear(hidden_size, n_actions)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
@@ -141,9 +191,17 @@ class AdvantageNet(nn.Module):
 
 
 class StrategyNet(nn.Module):
-    def __init__(self, obs_size: int, n_actions: int, hidden_size: int, num_blocks: int, dropout: float):
+    def __init__(
+        self,
+        obs_size: int,
+        n_actions: int,
+        hidden_size: int,
+        history_hidden: int,
+        num_blocks: int,
+        dropout: float,
+    ):
         super().__init__()
-        self.backbone = DeepCFRBackbone(obs_size, hidden_size, num_blocks, dropout)
+        self.backbone = DeepCFRBackbone(obs_size, hidden_size, history_hidden, num_blocks, dropout)
         self.head = nn.Linear(hidden_size, n_actions)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
@@ -223,6 +281,11 @@ def _build_checkpoint(
 ) -> dict:
     return {
         "iteration": iteration,
+        "model_arch": "gru_history_v1",
+        "obs_size": OBS_SIZE,
+        "base_obs_size": BASE_STATE_SIZE,
+        "history_len": HISTORY_LEN,
+        "history_event_size": HISTORY_EVENT_SIZE,
         "advantage_nets": [net.state_dict() for net in advantage_nets],
         "advantage_opts": [opt.state_dict() for opt in advantage_opts],
         "strategy_net": strategy_net.state_dict(),
@@ -230,6 +293,7 @@ def _build_checkpoint(
         "bet_fractions": bet_fractions,
         "players": args.players,
         "hidden_size": args.hidden_size,
+        "history_hidden": args.history_hidden,
         "num_blocks": args.num_blocks,
         "dropout": args.dropout,
     }
@@ -256,6 +320,7 @@ def _run_traversal_worker(
     invalid_action_penalty: float,
     bet_fractions: List[float],
     hidden_size: int,
+    history_hidden: int,
     num_blocks: int,
     dropout: float,
     advantage_state_dicts_cpu: List[dict],
@@ -281,7 +346,7 @@ def _run_traversal_worker(
 
     abstraction = ActionAbstraction(bet_fractions=bet_fractions)
     advantage_nets = [
-        AdvantageNet(OBS_SIZE, abstraction.n_actions, hidden_size, num_blocks, dropout).to(device)
+        AdvantageNet(OBS_SIZE, abstraction.n_actions, hidden_size, history_hidden, num_blocks, dropout).to(device)
         for _ in range(players)
     ]
     for i in range(players):
@@ -556,12 +621,26 @@ def train(args):
     make_env = build_env_factory(args, rng)
 
     advantage_nets = [
-        AdvantageNet(OBS_SIZE, abstraction.n_actions, args.hidden_size, args.num_blocks, args.dropout).to(device)
+        AdvantageNet(
+            OBS_SIZE,
+            abstraction.n_actions,
+            args.hidden_size,
+            args.history_hidden,
+            args.num_blocks,
+            args.dropout,
+        ).to(device)
         for _ in range(args.players)
     ]
     advantage_opts = [torch.optim.Adam(net.parameters(), lr=args.lr, weight_decay=args.weight_decay) for net in advantage_nets]
 
-    strategy_net = StrategyNet(OBS_SIZE, abstraction.n_actions, args.hidden_size, args.num_blocks, args.dropout).to(device)
+    strategy_net = StrategyNet(
+        OBS_SIZE,
+        abstraction.n_actions,
+        args.hidden_size,
+        args.history_hidden,
+        args.num_blocks,
+        args.dropout,
+    ).to(device)
     strategy_opt = torch.optim.Adam(strategy_net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     regret_buffers = [ReservoirBuffer(args.regret_buffer_capacity, rng) for _ in range(args.players)]
@@ -604,6 +683,12 @@ def train(args):
 
     if args.resume_from:
         checkpoint = torch.load(args.resume_from, map_location=device)
+        ckpt_obs_size = int(checkpoint.get("obs_size", 58))
+        if ckpt_obs_size != OBS_SIZE:
+            raise ValueError(
+                f"Checkpoint obs_size ({ckpt_obs_size}) is incompatible with current obs_size ({OBS_SIZE}). "
+                "Use a checkpoint trained with the history-aware model."
+            )
         ckpt_players = int(checkpoint.get("players", args.players))
         if ckpt_players != args.players:
             raise ValueError(
@@ -613,6 +698,11 @@ def train(args):
         if ckpt_bets != bet_fractions:
             raise ValueError(
                 f"--bet-fractions ({bet_fractions}) does not match checkpoint bet_fractions ({ckpt_bets})"
+            )
+        ckpt_history_hidden = int(checkpoint.get("history_hidden", args.history_hidden))
+        if ckpt_history_hidden != args.history_hidden:
+            raise ValueError(
+                f"--history-hidden ({args.history_hidden}) does not match checkpoint history_hidden ({ckpt_history_hidden})"
             )
         advantage_states = checkpoint["advantage_nets"]
         if len(advantage_states) != len(advantage_nets):
@@ -690,6 +780,7 @@ def train(args):
                             invalid_action_penalty=args.invalid_action_penalty,
                             bet_fractions=bet_fractions,
                             hidden_size=args.hidden_size,
+                            history_hidden=args.history_hidden,
                             num_blocks=args.num_blocks,
                             dropout=args.dropout,
                             advantage_state_dicts_cpu=advantage_state_dicts_cpu,
@@ -876,6 +967,7 @@ def parse_args():
     )
     parser.add_argument("--players", type=int, default=6, choices=[2, 3, 4, 5, 6], help="Players at the table")
     parser.add_argument("--hidden-size", type=int, default=512, help="Hidden layer width")
+    parser.add_argument("--history-hidden", type=int, default=128, help="GRU hidden size for encoded action history")
     parser.add_argument("--num-blocks", type=int, default=6, help="Number of residual blocks in each network")
     parser.add_argument("--dropout", type=float, default=0.10, help="Dropout in residual blocks")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")

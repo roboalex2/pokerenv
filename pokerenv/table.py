@@ -4,6 +4,7 @@ import time
 import gym
 import math
 from treys import Deck, Evaluator, Card
+import pokerenv.obs_indices as indices
 from pokerenv.common import GameState, PlayerState, PlayerAction, TablePosition, Action
 from pokerenv.player import Player
 from pokerenv.utils import pretty_print_hand, approx_gt, approx_lte
@@ -16,7 +17,7 @@ BB = 5
 class Table(gym.Env):
     def __init__(self, n_players, player_names=None, track_single_player=False, stack_low=50, stack_high=200, hand_history_location='hands/', invalid_action_penalty=0):
         self.action_space = gym.spaces.Tuple((gym.spaces.Discrete(4), gym.spaces.Box(-math.inf, math.inf, (1, 1))))
-        self.observation_space = gym.spaces.Box(-math.inf, math.inf, (58,), dtype=np.float32)
+        self.observation_space = gym.spaces.Box(-math.inf, math.inf, (indices.OBS_SIZE,), dtype=np.float32)
         self.n_players = n_players
         if player_names is None:
             player_names = {}
@@ -49,6 +50,7 @@ class Table(gym.Env):
         self.hand_settled = False
         self.last_bet_placed_by = None
         self.first_to_act = None
+        self.action_history = []
 
     def seed(self, seed=None):
         self.rng = np.random.default_rng(seed)
@@ -99,6 +101,7 @@ class Table(gym.Env):
 
         # History payload.
         cloned.hand_history = list(self.hand_history)
+        cloned.action_history = [event.copy() for event in self.action_history]
 
         return cloned
 
@@ -118,6 +121,7 @@ class Table(gym.Env):
         self.street_finished = False
         self.hand_is_over = False
         self.hand_settled = False
+        self.action_history = []
         initial_draw = self.deck.draw(self.n_players * 2)
         for i, player in enumerate(self.players):
             player.reset()
@@ -132,11 +136,13 @@ class Table(gym.Env):
                 self.pot += player.bet(0.5)
                 self._change_bet_to_match(0.5)
                 self._write_event("%s: posts small blind $%.2f" % (player.name, SB))
+                self._record_action_event(player, PlayerAction.BET, 0.5)
             elif player.position == TablePosition.BB:
                 self.pot += player.bet(1)
                 self._change_bet_to_match(1)
                 self.last_bet_placed_by = player
                 self._write_event("%s: posts big blind $%.2f" % (player.name, BB))
+                self._record_action_event(player, PlayerAction.BET, 1.0)
         self._set_next_player_for_street()
         if self.hand_history_enabled:
             self._write_hole_cards()
@@ -161,9 +167,11 @@ class Table(gym.Env):
                 player.fold()
                 self.active_players -= 1
                 self._write_event("%s: folds" % player.name)
+                self._record_action_event(player, PlayerAction.FOLD, 0.0)
             elif action.action_type is PlayerAction.CHECK:
                 player.check()
                 self._write_event("%s: checks" % player.name)
+                self._record_action_event(player, PlayerAction.CHECK, 0.0)
             elif action.action_type is PlayerAction.CALL:
                 call_size = player.call(self.bet_to_match)
                 self.pot += call_size
@@ -171,6 +179,7 @@ class Table(gym.Env):
                     self._write_event("%s: calls $%.2f and is all-in" % (player.name, call_size * BB))
                 else:
                     self._write_event("%s: calls $%.2f" % (player.name, call_size * BB))
+                self._record_action_event(player, PlayerAction.CALL, call_size)
             elif action.action_type is PlayerAction.BET:
                 previous_bet_this_street = player.bet_this_street
                 actual_bet_size = player.bet(np.round(action.bet_amount, 2))
@@ -195,6 +204,7 @@ class Table(gym.Env):
                                           )
                 self._change_bet_to_match(actual_bet_size + previous_bet_this_street)
                 self.last_bet_placed_by = player
+                self._record_action_event(player, PlayerAction.BET, actual_bet_size)
             else:
                 raise Exception("Error when parsing action, make sure player action_type is PlayerAction and not int")
 
@@ -326,6 +336,18 @@ class Table(gym.Env):
         if next_idx is not None:
             self.next_player_i = next_idx
 
+    def _record_action_event(self, player, action_type, amount):
+        event = np.zeros(indices.HISTORY_EVENT_SIZE, dtype=np.float32)
+        event[0] = 1.0
+        event[action_type.value + 1] = 1.0
+        event[5] = float(player.position) / max(float(self.n_players - 1), 1.0)
+        event[6] = float(self.street.value) / 3.0
+        event[7] = float(np.log1p(max(amount, 0.0)))
+        self.action_history.append(event)
+        if len(self.action_history) > indices.HISTORY_LEN:
+            # Keep only the history window used by observations.
+            self.action_history = self.action_history[-indices.HISTORY_LEN:]
+
     def _change_bet_to_match(self, new_amount):
         self.minimum_raise = new_amount - self.bet_to_match
         self.bet_to_match = new_amount
@@ -440,10 +462,12 @@ class Table(gym.Env):
                 player.fold()
                 self.active_players -= 1
                 self._write_event("%s: folds" % player.name)
+                self._record_action_event(player, PlayerAction.FOLD, 0.0)
                 return False
             if PlayerAction.CHECK in action_list:
                 player.check()
                 self._write_event("%s: checks" % player.name)
+                self._record_action_event(player, PlayerAction.CHECK, 0.0)
                 return False
             raise Exception('Something went wrong when validating actions, invalid contents of valid_actions')
         if action.action_type is PlayerAction.BET:
@@ -453,9 +477,11 @@ class Table(gym.Env):
                     player.fold()
                     self.active_players -= 1
                     self._write_event("%s: folds" % player.name)
+                    self._record_action_event(player, PlayerAction.FOLD, 0.0)
                 else:
                     player.check()
                     self._write_event("%s: checks" % player.name)
+                    self._record_action_event(player, PlayerAction.CHECK, 0.0)
                 return False
         return True
 
@@ -515,4 +541,11 @@ class Table(gym.Env):
             observation[26 + i * 6] = others[i].money_in_pot
             observation[27 + i * 6] = others[i].bet_this_street
             observation[28 + i * 6] = int(others[i].all_in)
+
+        # Append fixed-length recent action history, oldest->newest with left padding.
+        recent = self.action_history[-indices.HISTORY_LEN:]
+        pad = indices.HISTORY_LEN - len(recent)
+        for i, event in enumerate(recent):
+            start = indices.HISTORY_START + (pad + i) * indices.HISTORY_EVENT_SIZE
+            observation[start:start + indices.HISTORY_EVENT_SIZE] = event
         return observation
