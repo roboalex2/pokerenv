@@ -240,6 +240,12 @@ def _iteration_checkpoint_path(base_output: str, iteration: int) -> str:
     return str(base.with_name(f"{base.stem}_iter{iteration:04d}{base.suffix}"))
 
 
+def _ensure_parent_dir(path: str) -> None:
+    parent = Path(path).parent
+    if str(parent) and str(parent) != ".":
+        parent.mkdir(parents=True, exist_ok=True)
+
+
 def _run_traversal_worker(
     traverser_id: int,
     traversals: int,
@@ -802,6 +808,8 @@ def train(args):
                     iteration=iteration,
                 )
                 periodic_path = _iteration_checkpoint_path(args.output, iteration)
+                _ensure_parent_dir(periodic_path)
+                _ensure_parent_dir(args.output)
                 torch.save(ckpt, periodic_path)
                 torch.save(ckpt, args.output)
                 print(f"Saved periodic checkpoint to {periodic_path} (and updated {args.output})")
@@ -845,6 +853,7 @@ def train(args):
         args=args,
         iteration=max(start_iteration - 1, args.iterations),
     )
+    _ensure_parent_dir(args.output)
     torch.save(checkpoint, args.output)
     print(f"Saved Deep CFR checkpoint to {args.output}")
 
