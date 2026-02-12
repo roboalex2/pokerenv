@@ -203,7 +203,9 @@ def _split_work(total: int, parts: int) -> List[int]:
 
 
 def _cpu_state_dict(module: nn.Module) -> dict:
-    return {k: v.detach().cpu() for k, v in module.state_dict().items()}
+    # Serialize as NumPy to avoid PyTorch FD-based tensor sharing overhead
+    # when dispatching many multiprocessing tasks.
+    return {k: v.detach().cpu().numpy() for k, v in module.state_dict().items()}
 
 
 def _run_traversal_worker(
@@ -233,7 +235,11 @@ def _run_traversal_worker(
         for _ in range(players)
     ]
     for i in range(players):
-        advantage_nets[i].load_state_dict(advantage_state_dicts_cpu[i])
+        state_dict = {
+            k: torch.from_numpy(v.copy())
+            for k, v in advantage_state_dicts_cpu[i].items()
+        }
+        advantage_nets[i].load_state_dict(state_dict)
         advantage_nets[i].eval()
 
     regret_buffers = [_ListBuffer() for _ in range(players)]
@@ -440,6 +446,12 @@ def build_env_factory(args, rng: np.random.Generator) -> Callable[[], Table]:
 def train(args):
     rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
+    # In Linux/WSL multiprocessing, this avoids exhausting file descriptors
+    # when many worker tasks pass tensors.
+    try:
+        torch.multiprocessing.set_sharing_strategy("file_system")
+    except RuntimeError:
+        pass
 
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     if device.type == "cuda":
