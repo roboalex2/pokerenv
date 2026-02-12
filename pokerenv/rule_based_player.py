@@ -9,10 +9,6 @@ from treys import Card, Deck, Evaluator
 from pokerenv.common import Action, GameState, PlayerAction
 
 
-RANK_CHARS = "23456789TJQKA"
-SUIT_CHARS = {1: "c", 2: "d", 4: "h", 8: "s"}
-
-
 @dataclass
 class RuleBotConfig:
     monte_carlo_samples: int = 300
@@ -33,6 +29,12 @@ class RuleBasedPlayer:
         self.cfg = config or RuleBotConfig()
         self.rng = np.random.default_rng(self.cfg.rng_seed)
         self.evaluator = Evaluator()
+        # Build a robust lookup from (suit_int, rank_int) to exact treys card ints.
+        self.card_by_sr = {}
+        for c in Deck.GetFullDeck():
+            key = (Card.get_suit_int(c), Card.get_rank_int(c))
+            if key not in self.card_by_sr:
+                self.card_by_sr[key] = c
 
     def get_action(self, obs: np.ndarray) -> Action:
         valid = self._valid_actions(obs)
@@ -221,6 +223,8 @@ class RuleBasedPlayer:
 
     def _postflop_equity(self, obs: np.ndarray) -> float:
         hole, board = self._cards_from_obs(obs)
+        if len(set(hole + board)) != len(hole) + len(board):
+            return 0.5
         used_cards = set(hole + board)
         if len(hole) != 2:
             return 0.5
@@ -236,19 +240,25 @@ class RuleBasedPlayer:
             return 0.5
 
         for _ in range(self.cfg.monte_carlo_samples):
-            self.rng.shuffle(remain)
+            draw_n = opps * 2 + need_board
+            draw_idx = self.rng.choice(len(remain), size=draw_n, replace=False)
+            draw_cards = [remain[i] for i in draw_idx]
             ptr = 0
             opp_holes = []
             for _j in range(opps):
-                opp_holes.append([remain[ptr], remain[ptr + 1]])
+                opp_holes.append([draw_cards[ptr], draw_cards[ptr + 1]])
                 ptr += 2
             sim_board = list(board)
             for _j in range(need_board):
-                sim_board.append(remain[ptr])
+                sim_board.append(draw_cards[ptr])
                 ptr += 1
 
-            hero_rank = self.evaluator.evaluate(hole, sim_board)
-            opp_ranks = [self.evaluator.evaluate(opp, sim_board) for opp in opp_holes]
+            try:
+                hero_rank = self.evaluator.evaluate(hole, sim_board)
+                opp_ranks = [self.evaluator.evaluate(opp, sim_board) for opp in opp_holes]
+            except KeyError:
+                # Defensive guard for malformed card states; skip this sample.
+                continue
             best_opp = min(opp_ranks)
             if hero_rank < best_opp:
                 wins += 1.0
@@ -277,11 +287,7 @@ class RuleBasedPlayer:
     def _obs_card_to_int(self, suit_i: int, rank_i: int) -> int | None:
         if suit_i == 0:
             return None
-        suit = SUIT_CHARS.get(suit_i)
-        if suit is None or not (0 <= rank_i <= 12):
-            return None
-        rank = RANK_CHARS[rank_i]
-        return Card.new(rank + suit)
+        return self.card_by_sr.get((suit_i, rank_i))
 
     def _sized_bet(self, pot_frac: float, pot: float, low: float, high: float) -> float:
         target = pot * pot_frac
