@@ -12,6 +12,7 @@ It auto-uses CUDA when available (e.g. RTX 3070).
 from __future__ import annotations
 
 import argparse
+import time
 from dataclasses import dataclass
 from typing import Callable, List
 
@@ -284,11 +285,13 @@ def train_advantage_net(
     batch_size: int,
     train_steps: int,
     grad_clip: float,
+    log_every: int = 0,
+    log_prefix: str = "",
 ):
     if len(buffer) < batch_size:
         return
     net.train()
-    for _ in range(train_steps):
+    for step_i in range(1, train_steps + 1):
         batch = buffer.sample(batch_size)
         obs = torch.tensor(np.stack([item.obs for item in batch]), dtype=torch.float32, device=device)
         target_advantages = torch.tensor(np.stack([item.advantages for item in batch]), dtype=torch.float32, device=device)
@@ -301,6 +304,8 @@ def train_advantage_net(
         loss.backward()
         nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
         optimizer.step()
+        if log_every > 0 and (step_i % log_every == 0 or step_i == train_steps):
+            print(f"{log_prefix}adv_train step={step_i}/{train_steps} loss={loss.item():.5f}")
 
 
 def train_strategy_net(
@@ -311,11 +316,13 @@ def train_strategy_net(
     batch_size: int,
     train_steps: int,
     grad_clip: float,
+    log_every: int = 0,
+    log_prefix: str = "",
 ):
     if len(buffer) < batch_size:
         return
     net.train()
-    for _ in range(train_steps):
+    for step_i in range(1, train_steps + 1):
         batch = buffer.sample(batch_size)
         obs = torch.tensor(np.stack([item.obs for item in batch]), dtype=torch.float32, device=device)
         target_probs = torch.tensor(np.stack([item.probs for item in batch]), dtype=torch.float32, device=device)
@@ -330,6 +337,8 @@ def train_strategy_net(
         loss.backward()
         nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
         optimizer.step()
+        if log_every > 0 and (step_i % log_every == 0 or step_i == train_steps):
+            print(f"{log_prefix}strategy_train step={step_i}/{train_steps} loss={loss.item():.5f}")
 
 
 def build_env_factory(args, rng: np.random.Generator) -> Callable[[], Table]:
@@ -373,8 +382,16 @@ def train(args):
     strategy_buffer = ReservoirBuffer(args.strategy_buffer_capacity, rng)
 
     for iteration in range(1, args.iterations + 1):
+        iter_start = time.perf_counter()
+        if args.log_phase_timing:
+            print(f"[iter {iteration}] start")
+
+        traversals_start = time.perf_counter()
         for traverser_id in range(args.players):
+            if args.log_phase_timing:
+                print(f"[iter {iteration}] traverser={traverser_id} traversals start")
             for _ in range(args.traversals_per_player):
+                traversal_i = _ + 1
                 env = make_env()
                 obs = env.reset()
                 traverse_from_obs(
@@ -389,7 +406,14 @@ def train(args):
                     device=device,
                     depth_left=args.max_depth,
                 )
+                if args.log_traversal_every > 0 and (traversal_i % args.log_traversal_every == 0 or traversal_i == args.traversals_per_player):
+                    print(
+                        f"[iter {iteration}] traverser={traverser_id} "
+                        f"traversals={traversal_i}/{args.traversals_per_player}"
+                    )
+        traversals_s = time.perf_counter() - traversals_start
 
+        adv_start = time.perf_counter()
         for pid in range(args.players):
             train_advantage_net(
                 net=advantage_nets[pid],
@@ -399,8 +423,12 @@ def train(args):
                 batch_size=args.batch_size,
                 train_steps=args.adv_train_steps,
                 grad_clip=args.grad_clip,
+                log_every=args.log_train_every,
+                log_prefix=f"[iter {iteration}] [player {pid}] ",
             )
+        adv_s = time.perf_counter() - adv_start
 
+        strat_start = time.perf_counter()
         train_strategy_net(
             net=strategy_net,
             optimizer=strategy_opt,
@@ -409,13 +437,18 @@ def train(args):
             batch_size=args.batch_size,
             train_steps=args.strategy_train_steps,
             grad_clip=args.grad_clip,
+            log_every=args.log_train_every,
+            log_prefix=f"[iter {iteration}] ",
         )
+        strat_s = time.perf_counter() - strat_start
+        iter_s = time.perf_counter() - iter_start
 
         if iteration % args.log_every == 0:
             regret_sizes = [len(buf) for buf in regret_buffers]
             print(
                 f"iter={iteration:4d} regret_bufs={regret_sizes} "
-                f"strategy_buf={len(strategy_buffer)}"
+                f"strategy_buf={len(strategy_buffer)} "
+                f"time_s(total={iter_s:.1f}, traversals={traversals_s:.1f}, adv={adv_s:.1f}, strategy={strat_s:.1f})"
             )
 
     checkpoint = {
@@ -453,6 +486,23 @@ def parse_args():
     parser.add_argument("--stack-high", type=int, default=200, help="Maximum stack in big blinds")
     parser.add_argument("--invalid-action-penalty", type=float, default=0.01, help="Penalty for invalid actions")
     parser.add_argument("--log-every", type=int, default=1, help="How often to print logs (iterations)")
+    parser.add_argument(
+        "--log-traversal-every",
+        type=int,
+        default=25,
+        help="Print traversal progress every N traversals per traverser (0 disables)",
+    )
+    parser.add_argument(
+        "--log-train-every",
+        type=int,
+        default=50,
+        help="Print training progress every N SGD steps (0 disables)",
+    )
+    parser.add_argument(
+        "--log-phase-timing",
+        action="store_true",
+        help="Print iteration phase start markers for easier long-run monitoring",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--output", type=str, default="deep_cfr_checkpoint.pt", help="Path for the trained checkpoint")
     parser.add_argument("--cpu", action="store_true", help="Force CPU training")
