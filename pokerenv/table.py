@@ -301,7 +301,9 @@ class Table(gym.Env):
     def _write_hole_cards(self):
         self.hand_history.append("*** HOLE CARDS ***")
         for i, player in enumerate(self.players):
-            if self.track_single_player or player.identifier == 0:
+            # If tracking a single player, only reveal that player's hole cards.
+            # Otherwise reveal all players' cards in exported hand history.
+            if (not self.track_single_player) or player.identifier == 0:
                 self.hand_history.append("Dealt to %s [%s %s]" %
                                     (player.name, Card.int_to_str(player.cards[0]), Card.int_to_str(player.cards[1])))
 
@@ -416,10 +418,13 @@ class Table(gym.Env):
         valid_actions = [PlayerAction.CHECK, PlayerAction.FOLD, PlayerAction.BET, PlayerAction.CALL]
         valid_bet_range = [max(self.bet_to_match + self.minimum_raise, 1), player.stack + player.bet_this_street]
         others_active = [p for p in self.players if p.state is PlayerState.ACTIVE if not p.all_in if p is not player]
-        if self.bet_to_match == 0:
+        to_call = max(self.bet_to_match - player.bet_this_street, 0)
+        # No bet to call: checking is legal, calling/folding are not.
+        if to_call == 0:
             valid_actions.remove(PlayerAction.CALL)
             valid_actions.remove(PlayerAction.FOLD)
-        if self.bet_to_match != 0:
+        # Facing a bet: check is not legal.
+        else:
             valid_actions.remove(PlayerAction.CHECK)
         if player.stack < max(self.bet_to_match + self.minimum_raise, 1):
             valid_bet_range = [0, 0]

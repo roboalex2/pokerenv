@@ -26,6 +26,7 @@ import torch.nn.functional as F
 
 import pokerenv.obs_indices as indices
 from pokerenv.common import Action, PlayerAction
+from pokerenv.rule_based_player import RuleBasedPlayer, RuleBotConfig
 from pokerenv.table import Table
 
 
@@ -251,6 +252,9 @@ def _run_traversal_worker(
     dropout: float,
     advantage_state_dicts_cpu: List[dict],
     max_depth: int,
+    use_rule_opponents: bool,
+    rule_opp_prob: float,
+    rule_mc_samples: int,
 ):
     # Keep each worker single-threaded to avoid oversubscription when many workers run.
     torch.set_num_threads(1)
@@ -273,6 +277,14 @@ def _run_traversal_worker(
 
     regret_buffers = [_ListBuffer() for _ in range(players)]
     strategy_buffer = _ListBuffer()
+    rule_bot = None
+    if use_rule_opponents and rule_opp_prob > 0:
+        rule_bot = RuleBasedPlayer(
+            RuleBotConfig(
+                monte_carlo_samples=rule_mc_samples,
+                rng_seed=worker_seed + 13,
+            )
+        )
 
     for _ in range(traversals):
         env = Table(
@@ -294,6 +306,8 @@ def _run_traversal_worker(
             rng=rng,
             device=device,
             depth_left=max_depth,
+            rule_bot=rule_bot,
+            rule_opp_prob=rule_opp_prob,
         )
 
     return traverser_id, regret_buffers[traverser_id].data, strategy_buffer.data
@@ -330,19 +344,41 @@ def traverse_from_obs(
     rng: np.random.Generator,
     device: torch.device,
     depth_left: int,
+    rule_bot: RuleBasedPlayer | None = None,
+    rule_opp_prob: float = 0.0,
 ) -> float:
     if depth_left <= 0:
         return 0.0
 
     acting_id = int(obs[indices.ACTING_PLAYER])
     valid_mask = abstraction.valid_mask(obs)
-    policy = policy_from_adv_net(advantage_nets[acting_id], obs, valid_mask, device)
-
-    strategy_buffer.add(StrategySample(obs=obs.copy(), probs=policy.copy(), valid_mask=valid_mask.copy()))
 
     valid_actions = np.flatnonzero(valid_mask > 0)
     if len(valid_actions) == 0:
         return 0.0
+
+    if acting_id != traverser_id and rule_bot is not None and rule_opp_prob > 0 and rng.random() < rule_opp_prob:
+        env_action = rule_bot.get_action(obs)
+        obs2, rewards, done, _ = env.step(env_action)
+        if done:
+            return float(rewards[traverser_id])
+        return traverse_from_obs(
+            env,
+            obs2,
+            traverser_id,
+            abstraction,
+            advantage_nets,
+            regret_buffers,
+            strategy_buffer,
+            rng,
+            device,
+            depth_left - 1,
+            rule_bot=rule_bot,
+            rule_opp_prob=rule_opp_prob,
+        )
+
+    policy = policy_from_adv_net(advantage_nets[acting_id], obs, valid_mask, device)
+    strategy_buffer.add(StrategySample(obs=obs.copy(), probs=policy.copy(), valid_mask=valid_mask.copy()))
 
     if acting_id == traverser_id:
         action_values = np.zeros(abstraction.n_actions, dtype=np.float32)
@@ -362,6 +398,8 @@ def traverse_from_obs(
                 rng,
                 device,
                 depth_left - 1,
+                rule_bot=rule_bot,
+                rule_opp_prob=rule_opp_prob,
             )
             action_values[action_idx] = utility
             node_value += float(policy[action_idx] * utility)
@@ -391,6 +429,8 @@ def traverse_from_obs(
         rng,
         device,
         depth_left - 1,
+        rule_bot=rule_bot,
+        rule_opp_prob=rule_opp_prob,
     )
 
 
@@ -541,6 +581,12 @@ def train(args):
             print(f"[iter {iteration}] start")
 
         traversals_start = time.perf_counter()
+        use_rule_opponents = args.rule_warmup_iters > 0 and iteration <= args.rule_warmup_iters and args.rule_opp_prob > 0
+        if use_rule_opponents and args.log_phase_timing:
+            print(
+                f"[iter {iteration}] rule-opponent warmup active "
+                f"(prob={args.rule_opp_prob:.2f}, mc={args.rule_mc_samples})"
+            )
         if args.num_workers > 1:
             tasks = []
             advantage_state_dicts_cpu = [_cpu_state_dict(net) for net in advantage_nets]
@@ -583,6 +629,9 @@ def train(args):
                             dropout=args.dropout,
                             advantage_state_dicts_cpu=advantage_state_dicts_cpu,
                             max_depth=args.max_depth,
+                            use_rule_opponents=use_rule_opponents,
+                            rule_opp_prob=args.rule_opp_prob,
+                            rule_mc_samples=args.rule_mc_samples,
                         )
                     )
 
@@ -599,6 +648,14 @@ def train(args):
                             f"(regret+={len(regret_samples)}, strategy+={len(strategy_samples)})"
                         )
         else:
+            rule_bot = None
+            if use_rule_opponents:
+                rule_bot = RuleBasedPlayer(
+                    RuleBotConfig(
+                        monte_carlo_samples=args.rule_mc_samples,
+                        rng_seed=int(args.seed + iteration * 41),
+                    )
+                )
             for traverser_id in range(args.players):
                 if args.log_phase_timing:
                     print(f"[iter {iteration}] traverser={traverser_id} traversals start")
@@ -617,6 +674,8 @@ def train(args):
                         rng=rng,
                         device=device,
                         depth_left=args.max_depth,
+                        rule_bot=rule_bot,
+                        rule_opp_prob=args.rule_opp_prob,
                     )
                     if args.log_traversal_every > 0 and (traversal_i % args.log_traversal_every == 0 or traversal_i == args.traversals_per_player):
                         print(
@@ -749,6 +808,24 @@ def parse_args():
         help="Print multiprocessing traversal task completion every N tasks (0 disables)",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--rule-warmup-iters",
+        type=int,
+        default=0,
+        help="Use rule-based opponents for the first N iterations (0 disables)",
+    )
+    parser.add_argument(
+        "--rule-opp-prob",
+        type=float,
+        default=0.0,
+        help="Probability that a non-traverser opponent action uses the rule-based policy during warmup",
+    )
+    parser.add_argument(
+        "--rule-mc-samples",
+        type=int,
+        default=120,
+        help="Monte Carlo samples per postflop rule-based decision (higher is stronger/slower)",
+    )
     parser.add_argument("--output", type=str, default="deep_cfr_checkpoint.pt", help="Path for the trained checkpoint")
     parser.add_argument(
         "--save-every",
