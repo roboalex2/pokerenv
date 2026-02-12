@@ -1,3 +1,4 @@
+import copy
 import numpy as np
 import time
 import gym
@@ -50,6 +51,10 @@ class Table(gym.Env):
 
     def seed(self, seed=None):
         self.rng = np.random.default_rng(seed)
+
+    def clone(self):
+        """Return a deep-copied table state for game-tree traversals."""
+        return copy.deepcopy(self)
 
     def reset(self):
         self.current_turn = 0

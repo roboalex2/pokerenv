@@ -1,20 +1,24 @@
-"""Train a No Limit Hold'em self-play bot in pokerenv.
+"""Train a No Limit Hold'em bot with a Deep CFR-style loop.
 
-The training loop keeps a pool of older policy snapshots and samples opponents from
-that pool. The latest policy (hero) is optimized with a simple actor-critic loss.
-If CUDA is available (for example on an RTX 3070) it is used automatically.
+This implementation adapts Deep CFR concepts to pokerenv:
+- finite action abstraction with discrete bet buckets,
+- external-sampling traversals for regret samples,
+- advantage networks trained on reservoir buffers,
+- average strategy network trained from sampled behavior policies.
+
+It auto-uses CUDA when available (e.g. RTX 3070).
 """
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Callable, List
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.distributions import Categorical, Normal
+import torch.nn.functional as F
 
 import pokerenv.obs_indices as indices
 from pokerenv.common import Action, PlayerAction
@@ -22,160 +26,290 @@ from pokerenv.table import Table
 
 
 OBS_SIZE = 58
-N_ACTIONS = 4
 
 
-class PolicyValueNet(nn.Module):
-    def __init__(self, obs_size: int = OBS_SIZE, hidden_size: int = 256):
+@dataclass(frozen=True)
+class DiscreteAction:
+    kind: str
+    bucket_i: int = -1
+
+
+class ActionAbstraction:
+    """Maps pokerenv actions to a finite discrete action set for CFR."""
+
+    def __init__(self, bet_fractions: List[float]):
+        self.bet_fractions = bet_fractions
+        self.actions: List[DiscreteAction] = [
+            DiscreteAction("FOLD"),
+            DiscreteAction("CHECK"),
+            DiscreteAction("CALL"),
+            *[DiscreteAction("BET", i) for i in range(len(bet_fractions))],
+        ]
+
+    @property
+    def n_actions(self) -> int:
+        return len(self.actions)
+
+    def valid_mask(self, obs: np.ndarray) -> np.ndarray:
+        mask = np.zeros(self.n_actions, dtype=np.float32)
+        valid_env = obs[indices.VALID_ACTIONS]  # [CHECK, FOLD, BET, CALL]
+
+        if valid_env[PlayerAction.FOLD.value] == 1:
+            mask[0] = 1
+        if valid_env[PlayerAction.CHECK.value] == 1:
+            mask[1] = 1
+        if valid_env[PlayerAction.CALL.value] == 1:
+            mask[2] = 1
+
+        if valid_env[PlayerAction.BET.value] == 1:
+            bet_low = float(obs[indices.VALID_BET_LOW])
+            bet_high = float(obs[indices.VALID_BET_HIGH])
+            if bet_high >= bet_low and bet_high > 0:
+                mask[3:] = 1
+        return mask
+
+    def to_env_action(self, obs: np.ndarray, action_idx: int) -> Action:
+        discrete = self.actions[action_idx]
+        if discrete.kind == "FOLD":
+            return Action(PlayerAction.FOLD, 0.0)
+        if discrete.kind == "CHECK":
+            return Action(PlayerAction.CHECK, 0.0)
+        if discrete.kind == "CALL":
+            return Action(PlayerAction.CALL, 0.0)
+
+        bet_low = float(obs[indices.VALID_BET_LOW])
+        bet_high = float(obs[indices.VALID_BET_HIGH])
+        if bet_high <= bet_low:
+            return Action(PlayerAction.BET, bet_low)
+
+        frac = float(np.clip(self.bet_fractions[discrete.bucket_i], 0.0, 1.0))
+        amount = bet_low + frac * (bet_high - bet_low)
+        return Action(PlayerAction.BET, float(np.round(amount, 2)))
+
+
+class AdvantageNet(nn.Module):
+    def __init__(self, obs_size: int, n_actions: int, hidden_size: int):
         super().__init__()
-        self.backbone = nn.Sequential(
+        self.net = nn.Sequential(
             nn.Linear(obs_size, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
+            nn.Linear(hidden_size, n_actions),
         )
-        self.action_head = nn.Linear(hidden_size, N_ACTIONS)
-        self.bet_mean_head = nn.Linear(hidden_size, 1)
-        self.bet_log_std = nn.Parameter(torch.zeros(1))
-        self.value_head = nn.Linear(hidden_size, 1)
 
-    def forward(self, obs: torch.Tensor):
-        x = self.backbone(obs)
-        action_logits = self.action_head(x)
-        bet_mean = self.bet_mean_head(x)
-        value = self.value_head(x)
-        return action_logits, bet_mean, self.bet_log_std.expand_as(bet_mean), value
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.net(obs)
+
+
+class StrategyNet(nn.Module):
+    def __init__(self, obs_size: int, n_actions: int, hidden_size: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, n_actions),
+        )
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.net(obs)
 
 
 @dataclass
-class StepSample:
-    log_prob: torch.Tensor
-    value: torch.Tensor
-    entropy: torch.Tensor
+class RegretSample:
+    obs: np.ndarray
+    advantages: np.ndarray
+    valid_mask: np.ndarray
 
 
-class LearningAgent:
-    def __init__(self, model: PolicyValueNet, optimizer: torch.optim.Optimizer, device: torch.device):
-        self.model = model
-        self.optimizer = optimizer
-        self.device = device
-        self.samples: List[StepSample] = []
-
-    def reset_hand(self):
-        self.samples.clear()
-
-    def act(self, obs: np.ndarray) -> Action:
-        action, sample = sample_action(self.model, obs, self.device, training=True)
-        if sample is not None:
-            self.samples.append(sample)
-        return action
-
-    def finish_hand(self, final_reward: float, entropy_coef: float, value_coef: float, grad_clip: float):
-        if not self.samples:
-            return {"loss": 0.0, "reward": float(final_reward)}
-
-        reward_t = torch.tensor([final_reward], dtype=torch.float32, device=self.device)
-        policy_losses = []
-        value_losses = []
-        entropies = []
-
-        for sample in self.samples:
-            advantage = reward_t - sample.value.squeeze(-1)
-            policy_losses.append(-sample.log_prob * advantage.detach())
-            value_losses.append(advantage.pow(2))
-            entropies.append(sample.entropy)
-
-        policy_loss = torch.stack(policy_losses).mean()
-        value_loss = torch.stack(value_losses).mean()
-        entropy_bonus = torch.stack(entropies).mean()
-        total_loss = policy_loss + value_coef * value_loss - entropy_coef * entropy_bonus
-
-        self.optimizer.zero_grad(set_to_none=True)
-        total_loss.backward()
-        nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
-        self.optimizer.step()
-
-        return {
-            "loss": float(total_loss.item()),
-            "policy_loss": float(policy_loss.item()),
-            "value_loss": float(value_loss.item()),
-            "entropy": float(entropy_bonus.item()),
-            "reward": float(final_reward),
-        }
+@dataclass
+class StrategySample:
+    obs: np.ndarray
+    probs: np.ndarray
+    valid_mask: np.ndarray
 
 
-class FrozenPolicyAgent:
-    def __init__(self, model: PolicyValueNet, device: torch.device):
-        self.model = model
-        self.device = device
-
-    def act(self, obs: np.ndarray) -> Action:
-        with torch.no_grad():
-            action, _ = sample_action(self.model, obs, self.device, training=False)
-        return action
-
-
-class RandomAgent:
-    def __init__(self, rng: np.random.Generator):
+class ReservoirBuffer:
+    def __init__(self, capacity: int, rng: np.random.Generator):
+        self.capacity = capacity
         self.rng = rng
+        self.data: List[object] = []
+        self.seen = 0
 
-    def act(self, obs: np.ndarray) -> Action:
-        valid_actions = np.argwhere(obs[indices.VALID_ACTIONS] == 1).flatten()
-        chosen = PlayerAction(int(self.rng.choice(valid_actions)))
-        if chosen is PlayerAction.BET:
-            low = float(obs[indices.VALID_BET_LOW])
-            high = float(obs[indices.VALID_BET_HIGH])
-            bet = float(self.rng.uniform(low, high)) if high > low else low
-        else:
-            bet = 0.0
-        return Action(chosen, bet)
+    def __len__(self):
+        return len(self.data)
+
+    def add(self, item):
+        self.seen += 1
+        if len(self.data) < self.capacity:
+            self.data.append(item)
+            return
+        replace_idx = int(self.rng.integers(0, self.seen))
+        if replace_idx < self.capacity:
+            self.data[replace_idx] = item
+
+    def sample(self, batch_size: int):
+        idx = self.rng.integers(0, len(self.data), size=batch_size)
+        return [self.data[i] for i in idx]
 
 
-def sample_action(model: PolicyValueNet, obs: np.ndarray, device: torch.device, training: bool):
+def regret_matching(advantages: np.ndarray, valid_mask: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    positive = np.maximum(advantages, 0.0) * valid_mask
+    total = positive.sum()
+    if total <= eps:
+        denom = valid_mask.sum()
+        return valid_mask / max(denom, 1.0)
+    return positive / total
+
+
+@torch.no_grad()
+def policy_from_adv_net(net: AdvantageNet, obs: np.ndarray, valid_mask: np.ndarray, device: torch.device) -> np.ndarray:
     obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-    logits, bet_mean, bet_log_std, value = model(obs_t)
-
-    valid_mask = torch.tensor(obs[indices.VALID_ACTIONS], dtype=torch.float32, device=device).unsqueeze(0)
-    masked_logits = logits.masked_fill(valid_mask == 0, -1e9)
-    action_dist = Categorical(logits=masked_logits)
-    action_idx = action_dist.sample()
-
-    bet_low = float(obs[indices.VALID_BET_LOW])
-    bet_high = float(obs[indices.VALID_BET_HIGH])
-    chosen_action = PlayerAction(int(action_idx.item()))
-    bet_amount = 0.0
-
-    total_log_prob = action_dist.log_prob(action_idx)
-    entropy = action_dist.entropy()
-
-    if chosen_action is PlayerAction.BET and bet_high > bet_low:
-        bet_std = bet_log_std.exp().clamp_min(1e-3)
-        bet_dist = Normal(loc=bet_mean, scale=bet_std)
-        raw_bet = bet_dist.rsample()
-        bet_unit = torch.sigmoid(raw_bet)
-        bet = bet_low + (bet_high - bet_low) * bet_unit
-        bet_amount = float(bet.item())
-        total_log_prob = total_log_prob + bet_dist.log_prob(raw_bet).sum(-1)
-        entropy = entropy + bet_dist.entropy().sum(-1)
-    elif chosen_action is PlayerAction.BET:
-        bet_amount = bet_low
-
-    sample = None
-    if training:
-        sample = StepSample(log_prob=total_log_prob.squeeze(0), value=value.squeeze(0), entropy=entropy.squeeze(0))
-
-    return Action(chosen_action, bet_amount), sample
+    advantages = net(obs_t).squeeze(0).cpu().numpy()
+    return regret_matching(advantages, valid_mask)
 
 
-def build_frozen_agent_from_state(
-    state_dict: Dict[str, torch.Tensor],
+def traverse_from_obs(
+    env: Table,
+    obs: np.ndarray,
+    traverser_id: int,
+    abstraction: ActionAbstraction,
+    advantage_nets: List[AdvantageNet],
+    regret_buffers: List[ReservoirBuffer],
+    strategy_buffer: ReservoirBuffer,
+    rng: np.random.Generator,
     device: torch.device,
-    hidden_size: int,
-) -> FrozenPolicyAgent:
-    model = PolicyValueNet(hidden_size=hidden_size).to(device)
-    model.load_state_dict(state_dict)
-    model.eval()
-    return FrozenPolicyAgent(model, device)
+    depth_left: int,
+) -> float:
+    if depth_left <= 0:
+        return 0.0
+
+    acting_id = int(obs[indices.ACTING_PLAYER])
+    valid_mask = abstraction.valid_mask(obs)
+    policy = policy_from_adv_net(advantage_nets[acting_id], obs, valid_mask, device)
+
+    strategy_buffer.add(StrategySample(obs=obs.copy(), probs=policy.copy(), valid_mask=valid_mask.copy()))
+
+    valid_actions = np.flatnonzero(valid_mask > 0)
+    if len(valid_actions) == 0:
+        return 0.0
+
+    if acting_id == traverser_id:
+        action_values = np.zeros(abstraction.n_actions, dtype=np.float32)
+        node_value = 0.0
+        for action_idx in valid_actions:
+            child_env = env.clone()
+            env_action = abstraction.to_env_action(obs, int(action_idx))
+            obs2, rewards, done, _ = child_env.step(env_action)
+            utility = float(rewards[traverser_id]) if done else traverse_from_obs(
+                child_env,
+                obs2,
+                traverser_id,
+                abstraction,
+                advantage_nets,
+                regret_buffers,
+                strategy_buffer,
+                rng,
+                device,
+                depth_left - 1,
+            )
+            action_values[action_idx] = utility
+            node_value += float(policy[action_idx] * utility)
+
+        regret_buffers[traverser_id].add(
+            RegretSample(
+                obs=obs.copy(),
+                advantages=(action_values - node_value).astype(np.float32),
+                valid_mask=valid_mask.copy(),
+            )
+        )
+        return node_value
+
+    sampled_idx = int(rng.choice(valid_actions, p=policy[valid_actions] / policy[valid_actions].sum()))
+    env_action = abstraction.to_env_action(obs, sampled_idx)
+    obs2, rewards, done, _ = env.step(env_action)
+    if done:
+        return float(rewards[traverser_id])
+    return traverse_from_obs(
+        env,
+        obs2,
+        traverser_id,
+        abstraction,
+        advantage_nets,
+        regret_buffers,
+        strategy_buffer,
+        rng,
+        device,
+        depth_left - 1,
+    )
+
+
+def train_advantage_net(
+    net: AdvantageNet,
+    optimizer: torch.optim.Optimizer,
+    buffer: ReservoirBuffer,
+    device: torch.device,
+    batch_size: int,
+    train_steps: int,
+):
+    if len(buffer) < batch_size:
+        return
+    net.train()
+    for _ in range(train_steps):
+        batch = buffer.sample(batch_size)
+        obs = torch.tensor(np.stack([item.obs for item in batch]), dtype=torch.float32, device=device)
+        target_advantages = torch.tensor(np.stack([item.advantages for item in batch]), dtype=torch.float32, device=device)
+        valid_mask = torch.tensor(np.stack([item.valid_mask for item in batch]), dtype=torch.float32, device=device)
+
+        pred_advantages = net(obs)
+        loss = ((pred_advantages - target_advantages) ** 2 * valid_mask).sum(dim=1).mean()
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+
+def train_strategy_net(
+    net: StrategyNet,
+    optimizer: torch.optim.Optimizer,
+    buffer: ReservoirBuffer,
+    device: torch.device,
+    batch_size: int,
+    train_steps: int,
+):
+    if len(buffer) < batch_size:
+        return
+    net.train()
+    for _ in range(train_steps):
+        batch = buffer.sample(batch_size)
+        obs = torch.tensor(np.stack([item.obs for item in batch]), dtype=torch.float32, device=device)
+        target_probs = torch.tensor(np.stack([item.probs for item in batch]), dtype=torch.float32, device=device)
+        valid_mask = torch.tensor(np.stack([item.valid_mask for item in batch]), dtype=torch.float32, device=device)
+
+        logits = net(obs)
+        masked_logits = logits.masked_fill(valid_mask == 0, -1e9)
+        log_probs = F.log_softmax(masked_logits, dim=-1)
+        loss = -(target_probs * log_probs).sum(dim=1).mean()
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+
+def build_env_factory(args, rng: np.random.Generator) -> Callable[[], Table]:
+    def make_env() -> Table:
+        env = Table(
+            n_players=args.players,
+            stack_low=args.stack_low,
+            stack_high=args.stack_high,
+            invalid_action_penalty=args.invalid_action_penalty,
+        )
+        env.seed(int(args.seed + rng.integers(0, 1_000_000)))
+        return env
+
+    return make_env
 
 
 def train(args):
@@ -188,91 +322,93 @@ def train(args):
     else:
         print("Using CPU (CUDA not available or --cpu was set).")
 
-    table = Table(
-        n_players=args.players,
-        stack_low=args.stack_low,
-        stack_high=args.stack_high,
-        invalid_action_penalty=args.invalid_action_penalty,
-    )
-    table.seed(args.seed)
+    bet_fractions = [float(x) for x in args.bet_fractions.split(",") if x.strip()]
+    abstraction = ActionAbstraction(bet_fractions=bet_fractions)
+    make_env = build_env_factory(args, rng)
 
-    hero_model = PolicyValueNet(hidden_size=args.hidden_size).to(device)
-    optimizer = torch.optim.Adam(hero_model.parameters(), lr=args.lr)
-    hero_agent = LearningAgent(hero_model, optimizer, device)
+    advantage_nets = [AdvantageNet(OBS_SIZE, abstraction.n_actions, args.hidden_size).to(device) for _ in range(args.players)]
+    advantage_opts = [torch.optim.Adam(net.parameters(), lr=args.lr) for net in advantage_nets]
 
-    snapshot_pool: List[Optional[Dict[str, torch.Tensor]]] = [None]
-    recent_rewards: List[float] = []
+    strategy_net = StrategyNet(OBS_SIZE, abstraction.n_actions, args.hidden_size).to(device)
+    strategy_opt = torch.optim.Adam(strategy_net.parameters(), lr=args.lr)
 
-    for hand_idx in range(1, args.hands + 1):
-        obs = table.reset()
-        hero_agent.reset_hand()
+    regret_buffers = [ReservoirBuffer(args.regret_buffer_capacity, rng) for _ in range(args.players)]
+    strategy_buffer = ReservoirBuffer(args.strategy_buffer_capacity, rng)
 
-        opponent_agents: Dict[int, object] = {}
-        for pid in range(1, args.players):
-            snapshot = snapshot_pool[int(rng.integers(0, len(snapshot_pool)))]
-            if snapshot is None:
-                opponent_agents[pid] = RandomAgent(rng)
-            else:
-                opponent_agents[pid] = build_frozen_agent_from_state(snapshot, device, args.hidden_size)
+    for iteration in range(1, args.iterations + 1):
+        for traverser_id in range(args.players):
+            for _ in range(args.traversals_per_player):
+                env = make_env()
+                obs = env.reset()
+                traverse_from_obs(
+                    env=env,
+                    obs=obs,
+                    traverser_id=traverser_id,
+                    abstraction=abstraction,
+                    advantage_nets=advantage_nets,
+                    regret_buffers=regret_buffers,
+                    strategy_buffer=strategy_buffer,
+                    rng=rng,
+                    device=device,
+                    depth_left=args.max_depth,
+                )
 
-        done = False
-        final_reward = 0.0
-        while not done:
-            acting_player = int(obs[indices.ACTING_PLAYER])
-            if acting_player == 0:
-                action = hero_agent.act(obs)
-            else:
-                action = opponent_agents[acting_player].act(obs)
-
-            obs, reward, done, _ = table.step(action)
-            if done:
-                final_reward = float(reward[0])
-
-        metrics = hero_agent.finish_hand(
-            final_reward=final_reward,
-            entropy_coef=args.entropy_coef,
-            value_coef=args.value_coef,
-            grad_clip=args.grad_clip,
-        )
-        recent_rewards.append(final_reward)
-        if len(recent_rewards) > args.log_window:
-            recent_rewards.pop(0)
-
-        if hand_idx % args.snapshot_interval == 0:
-            state = {k: v.detach().cpu().clone() for k, v in hero_model.state_dict().items()}
-            snapshot_pool.append(state)
-            if len(snapshot_pool) > args.max_snapshots + 1:
-                snapshot_pool.pop(1)
-
-        if hand_idx % args.log_every == 0:
-            avg_reward = float(np.mean(recent_rewards)) if recent_rewards else 0.0
-            print(
-                f"hand={hand_idx:6d} avg_reward={avg_reward:+.4f} "
-                f"loss={metrics['loss']:+.4f} pool={len(snapshot_pool)-1}"
+        for pid in range(args.players):
+            train_advantage_net(
+                net=advantage_nets[pid],
+                optimizer=advantage_opts[pid],
+                buffer=regret_buffers[pid],
+                device=device,
+                batch_size=args.batch_size,
+                train_steps=args.adv_train_steps,
             )
 
-    torch.save(hero_model.state_dict(), args.output)
-    print(f"Saved trained model to {args.output}")
+        train_strategy_net(
+            net=strategy_net,
+            optimizer=strategy_opt,
+            buffer=strategy_buffer,
+            device=device,
+            batch_size=args.batch_size,
+            train_steps=args.strategy_train_steps,
+        )
+
+        if iteration % args.log_every == 0:
+            regret_sizes = [len(buf) for buf in regret_buffers]
+            print(
+                f"iter={iteration:4d} regret_bufs={regret_sizes} "
+                f"strategy_buf={len(strategy_buffer)}"
+            )
+
+    checkpoint = {
+        "advantage_nets": [net.state_dict() for net in advantage_nets],
+        "strategy_net": strategy_net.state_dict(),
+        "bet_fractions": bet_fractions,
+        "players": args.players,
+    }
+    torch.save(checkpoint, args.output)
+    print(f"Saved Deep CFR checkpoint to {args.output}")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Self-play trainer for no-limit hold'em using pokerenv")
-    parser.add_argument("--hands", type=int, default=50000, help="Number of training hands")
+    parser = argparse.ArgumentParser(description="Deep CFR-style trainer for no-limit hold'em using pokerenv")
+    parser.add_argument("--iterations", type=int, default=100, help="Number of CFR iterations")
+    parser.add_argument("--traversals-per-player", type=int, default=100, help="Traversals per player each iteration")
     parser.add_argument("--players", type=int, default=6, choices=[2, 3, 4, 5, 6], help="Players at the table")
     parser.add_argument("--hidden-size", type=int, default=256, help="Hidden layer width")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
-    parser.add_argument("--entropy-coef", type=float, default=0.01, help="Entropy bonus coefficient")
-    parser.add_argument("--value-coef", type=float, default=0.5, help="Value loss coefficient")
-    parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping norm")
-    parser.add_argument("--snapshot-interval", type=int, default=500, help="Hands between opponent snapshots")
-    parser.add_argument("--max-snapshots", type=int, default=20, help="Maximum historical snapshots to keep")
+    parser.add_argument("--batch-size", type=int, default=256, help="Training batch size")
+    parser.add_argument("--adv-train-steps", type=int, default=200, help="Advantage net SGD steps per iteration")
+    parser.add_argument("--strategy-train-steps", type=int, default=200, help="Strategy net SGD steps per iteration")
+    parser.add_argument("--regret-buffer-capacity", type=int, default=200000, help="Reservoir capacity per regret buffer")
+    parser.add_argument("--strategy-buffer-capacity", type=int, default=500000, help="Reservoir capacity for strategy samples")
+    parser.add_argument("--bet-fractions", type=str, default="0.1,0.25,0.5,0.75,1.0", help="Comma-separated bet bucket fractions in [0,1]")
+    parser.add_argument("--max-depth", type=int, default=512, help="Traversal depth cutoff")
     parser.add_argument("--stack-low", type=int, default=50, help="Minimum stack in big blinds")
     parser.add_argument("--stack-high", type=int, default=200, help="Maximum stack in big blinds")
     parser.add_argument("--invalid-action-penalty", type=float, default=0.01, help="Penalty for invalid actions")
-    parser.add_argument("--log-every", type=int, default=100, help="How often to print training logs")
-    parser.add_argument("--log-window", type=int, default=500, help="Window size for avg reward logs")
+    parser.add_argument("--log-every", type=int, default=1, help="How often to print logs (iterations)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--output", type=str, default="self_play_policy.pt", help="Path for the trained model")
+    parser.add_argument("--output", type=str, default="deep_cfr_checkpoint.pt", help="Path for the trained checkpoint")
     parser.add_argument("--cpu", action="store_true", help="Force CPU training")
     return parser.parse_args()
 
