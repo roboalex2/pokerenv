@@ -28,12 +28,11 @@ class Player:
         return self.identifier > other.identifier
 
     def get_reward(self):
+        tmp = self.pending_penalty
+        self.pending_penalty = 0
         if self.has_acted:
-            tmp = self.pending_penalty
-            self.pending_penalty = 0
             return tmp + self.winnings
-        else:
-            return None
+        return tmp
 
     def fold(self):
         self.has_acted = True

@@ -192,8 +192,12 @@ def regret_matching(advantages: np.ndarray, valid_mask: np.ndarray, eps: float =
 
 @torch.no_grad()
 def policy_from_adv_net(net: AdvantageNet, obs: np.ndarray, valid_mask: np.ndarray, device: torch.device) -> np.ndarray:
+    was_training = net.training
+    net.eval()
     obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
     advantages = net(obs_t).squeeze(0).cpu().numpy()
+    if was_training:
+        net.train()
     return regret_matching(advantages, valid_mask)
 
 

@@ -16,7 +16,7 @@ BB = 5
 class Table(gym.Env):
     def __init__(self, n_players, player_names=None, track_single_player=False, stack_low=50, stack_high=200, hand_history_location='hands/', invalid_action_penalty=0):
         self.action_space = gym.spaces.Tuple((gym.spaces.Discrete(4), gym.spaces.Box(-math.inf, math.inf, (1, 1))))
-        self.observation_space = gym.spaces.Box(-math.inf, math.inf, (58, 1))
+        self.observation_space = gym.spaces.Box(-math.inf, math.inf, (58,), dtype=np.float32)
         self.n_players = n_players
         if player_names is None:
             player_names = {}
@@ -46,6 +46,7 @@ class Table(gym.Env):
         self.rng = np.random.default_rng(None)
         self.street_finished = False
         self.hand_is_over = False
+        self.hand_settled = False
         self.last_bet_placed_by = None
         self.first_to_act = None
 
@@ -71,6 +72,7 @@ class Table(gym.Env):
         self.first_to_act = None
         self.street_finished = False
         self.hand_is_over = False
+        self.hand_settled = False
         initial_draw = self.deck.draw(self.n_players * 2)
         for i, player in enumerate(self.players):
             player.reset()
@@ -203,6 +205,14 @@ class Table(gym.Env):
         if self.street_finished and not self.hand_is_over:
             self._street_transition()
 
+        if self.hand_is_over and not self.hand_settled:
+            self._distribute_pot()
+            self._finish_hand()
+            self.hand_settled = True
+            # Ensure terminal rewards are always emitted as numeric values.
+            for p in self.players:
+                p.has_acted = True
+
         obs = np.zeros(self.observation_space.shape[0]) if self.hand_is_over else self._get_observation(self.players[self.next_player_i])
         rewards = np.asarray([player.get_reward() for player in sorted(self.players)])
         return obs, rewards, self.hand_is_over, {}
@@ -272,13 +282,17 @@ class Table(gym.Env):
 
     def _write_show_down(self):
         self.hand_history.append("*** SHOW DOWN ***")
-        hand_types = [self.evaluator.class_to_string(self.evaluator.get_rank_class(p.hand_rank))
-                        for p in self.players if p.state is PlayerState.ACTIVE]
+        active_players = [p for p in self.players if p.state is PlayerState.ACTIVE]
+        for player in active_players:
+            player.calculate_hand_rank(self.evaluator, self.cards)
+        hand_types = [
+            self.evaluator.class_to_string(self.evaluator.get_rank_class(p.hand_rank))
+            for p in active_players
+        ]
         for player in self.players:
             if player.state is PlayerState.ACTIVE:
-                player.calculate_hand_rank(self.evaluator, self.cards)
                 player_hand_type = self.evaluator.class_to_string(self.evaluator.get_rank_class(player.hand_rank))
-                matches = len([m for m in hand_types if m is player_hand_type])
+                matches = len([m for m in hand_types if m == player_hand_type])
                 multiple = matches > 1
                 self.hand_history.append("%s: shows [%s %s] (%s)" %
                                     (player.name, Card.int_to_str(player.cards[0]), Card.int_to_str(player.cards[1]),
@@ -361,7 +375,8 @@ class Table(gym.Env):
                 return False
             raise Exception('Something went wrong when validating actions, invalid contents of valid_actions')
         if action.action_type is PlayerAction.BET:
-            if not (approx_lte(bet_range[0], action.bet_amount) and approx_lte(action.bet_amount, bet_range[1])) or approx_gt(action.bet_amount, player.stack):
+            max_total_bet = player.stack + player.bet_this_street
+            if not (approx_lte(bet_range[0], action.bet_amount) and approx_lte(action.bet_amount, bet_range[1])) or approx_gt(action.bet_amount, max_total_bet):
                 if PlayerAction.FOLD in action_list:
                     player.fold()
                     self.active_players -= 1
@@ -374,7 +389,7 @@ class Table(gym.Env):
 
     def _get_valid_actions(self, player):
         valid_actions = [PlayerAction.CHECK, PlayerAction.FOLD, PlayerAction.BET, PlayerAction.CALL]
-        valid_bet_range = [max(self.bet_to_match + self.minimum_raise, 1), player.stack]
+        valid_bet_range = [max(self.bet_to_match + self.minimum_raise, 1), player.stack + player.bet_this_street]
         others_active = [p for p in self.players if p.state is PlayerState.ACTIVE if not p.all_in if p is not player]
         if self.bet_to_match == 0:
             valid_actions.remove(PlayerAction.CALL)
