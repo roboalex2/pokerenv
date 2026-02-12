@@ -98,3 +98,24 @@ class Player:
         self.pending_penalty = 0
         self.winnings = 0
         self.winnings_for_hh = 0
+
+    def clone(self):
+        p = Player.__new__(Player)
+        p.state = self.state
+        p.has_acted = self.has_acted
+        p.acted_this_street = self.acted_this_street
+        p.identifier = self.identifier
+        p.name = self.name
+        p.stack = self.stack
+        p.cards = list(self.cards)
+        p.position = self.position
+        p.all_in = self.all_in
+        p.bet_this_street = self.bet_this_street
+        p.money_in_pot = self.money_in_pot
+        p.history = [dict(h) for h in self.history]
+        p.hand_rank = self.hand_rank
+        p.pending_penalty = self.pending_penalty
+        p.winnings = self.winnings
+        p.winnings_for_hh = self.winnings_for_hh
+        p.penalty = self.penalty
+        return p

@@ -54,8 +54,53 @@ class Table(gym.Env):
         self.rng = np.random.default_rng(seed)
 
     def clone(self):
-        """Return a deep-copied table state for game-tree traversals."""
-        return copy.deepcopy(self)
+        """Return a fast-copied table state for game-tree traversals."""
+        cloned = Table.__new__(Table)
+
+        # Immutable/shared configuration.
+        cloned.action_space = self.action_space
+        cloned.observation_space = self.observation_space
+        cloned.n_players = self.n_players
+        cloned.track_single_player = self.track_single_player
+        cloned.hand_history_location = self.hand_history_location
+        cloned.hand_history_enabled = self.hand_history_enabled
+        cloned.stack_low = self.stack_low
+        cloned.stack_high = self.stack_high
+        cloned.evaluator = self.evaluator
+
+        # Scalar mutable state.
+        cloned.active_players = self.active_players
+        cloned.next_player_i = self.next_player_i
+        cloned.current_player_i = self.current_player_i
+        cloned.current_turn = self.current_turn
+        cloned.pot = self.pot
+        cloned.bet_to_match = self.bet_to_match
+        cloned.minimum_raise = self.minimum_raise
+        cloned.street = self.street
+        cloned.street_finished = self.street_finished
+        cloned.hand_is_over = self.hand_is_over
+        cloned.hand_settled = self.hand_settled
+
+        # Copy players while preserving object reference relationships.
+        cloned.all_players = [p.clone() for p in self.all_players]
+        player_map = {old: new for old, new in zip(self.all_players, cloned.all_players)}
+        cloned.players = [player_map[p] for p in self.players]
+        cloned.last_bet_placed_by = None if self.last_bet_placed_by is None else player_map[self.last_bet_placed_by]
+        cloned.first_to_act = None if self.first_to_act is None else player_map[self.first_to_act]
+
+        # Deck and board state.
+        cloned.deck = Deck()
+        cloned.deck.cards = list(self.deck.cards)
+        cloned.cards = list(self.cards)
+
+        # RNG state.
+        cloned.rng = np.random.default_rng()
+        cloned.rng.bit_generator.state = copy.deepcopy(self.rng.bit_generator.state)
+
+        # History payload.
+        cloned.hand_history = list(self.hand_history)
+
+        return cloned
 
     def reset(self):
         self.current_turn = 0
