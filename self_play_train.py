@@ -87,34 +87,60 @@ class ActionAbstraction:
         return Action(PlayerAction.BET, float(np.round(amount, 2)))
 
 
-class AdvantageNet(nn.Module):
-    def __init__(self, obs_size: int, n_actions: int, hidden_size: int):
+class ResidualBlock(nn.Module):
+    def __init__(self, hidden_size: int, dropout: float):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, n_actions),
+        self.norm = nn.LayerNorm(hidden_size)
+        self.ff = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.Dropout(dropout),
         )
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.ff(self.norm(x))
+
+
+class DeepCFRBackbone(nn.Module):
+    """Residual MLP encoder for poker information-state features."""
+
+    def __init__(self, obs_size: int, hidden_size: int, num_blocks: int, dropout: float):
+        super().__init__()
+        self.input_proj = nn.Sequential(
+            nn.Linear(obs_size, hidden_size),
+            nn.GELU(),
+            nn.LayerNorm(hidden_size),
+        )
+        self.blocks = nn.ModuleList([ResidualBlock(hidden_size, dropout) for _ in range(num_blocks)])
+        self.out_norm = nn.LayerNorm(hidden_size)
+
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.net(obs)
+        x = self.input_proj(obs)
+        for block in self.blocks:
+            x = block(x)
+        return self.out_norm(x)
+
+
+class AdvantageNet(nn.Module):
+    def __init__(self, obs_size: int, n_actions: int, hidden_size: int, num_blocks: int, dropout: float):
+        super().__init__()
+        self.backbone = DeepCFRBackbone(obs_size, hidden_size, num_blocks, dropout)
+        self.head = nn.Linear(hidden_size, n_actions)
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.head(self.backbone(obs))
 
 
 class StrategyNet(nn.Module):
-    def __init__(self, obs_size: int, n_actions: int, hidden_size: int):
+    def __init__(self, obs_size: int, n_actions: int, hidden_size: int, num_blocks: int, dropout: float):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, n_actions),
-        )
+        self.backbone = DeepCFRBackbone(obs_size, hidden_size, num_blocks, dropout)
+        self.head = nn.Linear(hidden_size, n_actions)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.net(obs)
+        return self.head(self.backbone(obs))
 
 
 @dataclass
@@ -253,6 +279,7 @@ def train_advantage_net(
     device: torch.device,
     batch_size: int,
     train_steps: int,
+    grad_clip: float,
 ):
     if len(buffer) < batch_size:
         return
@@ -268,6 +295,7 @@ def train_advantage_net(
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
         optimizer.step()
 
 
@@ -278,6 +306,7 @@ def train_strategy_net(
     device: torch.device,
     batch_size: int,
     train_steps: int,
+    grad_clip: float,
 ):
     if len(buffer) < batch_size:
         return
@@ -295,6 +324,7 @@ def train_strategy_net(
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
         optimizer.step()
 
 
@@ -326,11 +356,14 @@ def train(args):
     abstraction = ActionAbstraction(bet_fractions=bet_fractions)
     make_env = build_env_factory(args, rng)
 
-    advantage_nets = [AdvantageNet(OBS_SIZE, abstraction.n_actions, args.hidden_size).to(device) for _ in range(args.players)]
-    advantage_opts = [torch.optim.Adam(net.parameters(), lr=args.lr) for net in advantage_nets]
+    advantage_nets = [
+        AdvantageNet(OBS_SIZE, abstraction.n_actions, args.hidden_size, args.num_blocks, args.dropout).to(device)
+        for _ in range(args.players)
+    ]
+    advantage_opts = [torch.optim.Adam(net.parameters(), lr=args.lr, weight_decay=args.weight_decay) for net in advantage_nets]
 
-    strategy_net = StrategyNet(OBS_SIZE, abstraction.n_actions, args.hidden_size).to(device)
-    strategy_opt = torch.optim.Adam(strategy_net.parameters(), lr=args.lr)
+    strategy_net = StrategyNet(OBS_SIZE, abstraction.n_actions, args.hidden_size, args.num_blocks, args.dropout).to(device)
+    strategy_opt = torch.optim.Adam(strategy_net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     regret_buffers = [ReservoirBuffer(args.regret_buffer_capacity, rng) for _ in range(args.players)]
     strategy_buffer = ReservoirBuffer(args.strategy_buffer_capacity, rng)
@@ -361,6 +394,7 @@ def train(args):
                 device=device,
                 batch_size=args.batch_size,
                 train_steps=args.adv_train_steps,
+                grad_clip=args.grad_clip,
             )
 
         train_strategy_net(
@@ -370,6 +404,7 @@ def train(args):
             device=device,
             batch_size=args.batch_size,
             train_steps=args.strategy_train_steps,
+            grad_clip=args.grad_clip,
         )
 
         if iteration % args.log_every == 0:
@@ -384,6 +419,9 @@ def train(args):
         "strategy_net": strategy_net.state_dict(),
         "bet_fractions": bet_fractions,
         "players": args.players,
+        "hidden_size": args.hidden_size,
+        "num_blocks": args.num_blocks,
+        "dropout": args.dropout,
     }
     torch.save(checkpoint, args.output)
     print(f"Saved Deep CFR checkpoint to {args.output}")
@@ -394,8 +432,12 @@ def parse_args():
     parser.add_argument("--iterations", type=int, default=100, help="Number of CFR iterations")
     parser.add_argument("--traversals-per-player", type=int, default=100, help="Traversals per player each iteration")
     parser.add_argument("--players", type=int, default=6, choices=[2, 3, 4, 5, 6], help="Players at the table")
-    parser.add_argument("--hidden-size", type=int, default=256, help="Hidden layer width")
+    parser.add_argument("--hidden-size", type=int, default=512, help="Hidden layer width")
+    parser.add_argument("--num-blocks", type=int, default=6, help="Number of residual blocks in each network")
+    parser.add_argument("--dropout", type=float, default=0.10, help="Dropout in residual blocks")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
+    parser.add_argument("--weight-decay", type=float, default=1e-5, help="Adam weight decay")
+    parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping norm")
     parser.add_argument("--batch-size", type=int, default=256, help="Training batch size")
     parser.add_argument("--adv-train-steps", type=int, default=200, help="Advantage net SGD steps per iteration")
     parser.add_argument("--strategy-train-steps", type=int, default=200, help="Strategy net SGD steps per iteration")

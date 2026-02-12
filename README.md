@@ -120,7 +120,8 @@ It uses:
 - finite action abstraction via discrete bet buckets,
 - external-sampling traversals to collect regret samples,
 - per-player advantage networks trained from reservoir buffers,
-- an average strategy network trained on sampled behavior policies.
+- an average strategy network trained on sampled behavior policies,
+- deeper residual MLP encoders (LayerNorm + GELU + dropout) for stronger function approximation stability.
 
 ```bash
 pip install torch
