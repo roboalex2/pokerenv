@@ -12,6 +12,7 @@ It auto-uses CUDA when available (e.g. RTX 3070).
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -446,8 +447,9 @@ def train_advantage_net(
     log_prefix: str = "",
 ):
     if len(buffer) < batch_size:
-        return
+        return float("nan"), 0
     net.train()
+    loss_sum = 0.0
     for step_i in range(1, train_steps + 1):
         batch = buffer.sample(batch_size)
         obs = torch.tensor(np.stack([item.obs for item in batch]), dtype=torch.float32, device=device)
@@ -461,8 +463,10 @@ def train_advantage_net(
         loss.backward()
         nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
         optimizer.step()
+        loss_sum += float(loss.item())
         if log_every > 0 and (step_i % log_every == 0 or step_i == train_steps):
             print(f"{log_prefix}adv_train step={step_i}/{train_steps} loss={loss.item():.5f}")
+    return loss_sum / max(train_steps, 1), train_steps
 
 
 def train_strategy_net(
@@ -477,8 +481,9 @@ def train_strategy_net(
     log_prefix: str = "",
 ):
     if len(buffer) < batch_size:
-        return
+        return float("nan"), 0
     net.train()
+    loss_sum = 0.0
     for step_i in range(1, train_steps + 1):
         batch = buffer.sample(batch_size)
         obs = torch.tensor(np.stack([item.obs for item in batch]), dtype=torch.float32, device=device)
@@ -494,8 +499,10 @@ def train_strategy_net(
         loss.backward()
         nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
         optimizer.step()
+        loss_sum += float(loss.item())
         if log_every > 0 and (step_i % log_every == 0 or step_i == train_steps):
             print(f"{log_prefix}strategy_train step={step_i}/{train_steps} loss={loss.item():.5f}")
+    return loss_sum / max(train_steps, 1), train_steps
 
 
 def build_env_factory(args, rng: np.random.Generator) -> Callable[[], Table]:
@@ -545,6 +552,39 @@ def train(args):
     strategy_buffer = ReservoirBuffer(args.strategy_buffer_capacity, rng)
     start_iteration = 1
     mp_pool = None
+    run_id = time.strftime("%Y%m%d_%H%M%S")
+
+    metrics_fieldnames = [
+        "run_id",
+        "iteration",
+        "timestamp_utc",
+        "time_total_s",
+        "time_traversals_s",
+        "time_adv_train_s",
+        "time_strategy_train_s",
+        "regret_samples_added_total",
+        "strategy_samples_added",
+        "regret_buffer_total_size",
+        "strategy_buffer_size",
+        "adv_loss_mean",
+        "adv_steps_total",
+        "strategy_loss",
+        "strategy_steps",
+        "periodic_checkpoint_saved",
+    ]
+    metrics_fieldnames += [f"regret_buffer_p{i}_size" for i in range(args.players)]
+    metrics_fieldnames += [f"regret_samples_added_p{i}" for i in range(args.players)]
+    metrics_fieldnames += [f"adv_loss_p{i}" for i in range(args.players)]
+
+    metrics_dir = os.path.dirname(args.metrics_file)
+    if metrics_dir:
+        os.makedirs(metrics_dir, exist_ok=True)
+    metrics_new_file = not os.path.exists(args.metrics_file) or os.path.getsize(args.metrics_file) == 0
+    metrics_fh = open(args.metrics_file, "a", newline="", encoding="utf-8")
+    metrics_writer = csv.DictWriter(metrics_fh, fieldnames=metrics_fieldnames)
+    if metrics_new_file:
+        metrics_writer.writeheader()
+        metrics_fh.flush()
 
     if args.resume_from:
         checkpoint = torch.load(args.resume_from, map_location=device)
@@ -584,10 +624,13 @@ def train(args):
 
         for iteration in range(start_iteration, args.iterations + 1):
             iter_start = time.perf_counter()
+            ts_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             if args.log_phase_timing:
                 print(f"[iter {iteration}] start")
 
             traversals_start = time.perf_counter()
+            regret_sizes_before = [len(buf) for buf in regret_buffers]
+            strategy_size_before = len(strategy_buffer)
             use_rule_opponents = args.rule_warmup_iters > 0 and iteration <= args.rule_warmup_iters and args.rule_opp_prob > 0
             if use_rule_opponents and args.log_phase_timing:
                 print(
@@ -691,8 +734,10 @@ def train(args):
             traversals_s = time.perf_counter() - traversals_start
 
             adv_start = time.perf_counter()
+            adv_losses = []
+            adv_steps_total = 0
             for pid in range(args.players):
-                train_advantage_net(
+                adv_loss, adv_steps = train_advantage_net(
                     net=advantage_nets[pid],
                     optimizer=advantage_opts[pid],
                     buffer=regret_buffers[pid],
@@ -703,10 +748,12 @@ def train(args):
                     log_every=args.log_train_every,
                     log_prefix=f"[iter {iteration}] [player {pid}] ",
                 )
+                adv_losses.append(adv_loss)
+                adv_steps_total += adv_steps
             adv_s = time.perf_counter() - adv_start
 
             strat_start = time.perf_counter()
-            train_strategy_net(
+            strategy_loss, strategy_steps = train_strategy_net(
                 net=strategy_net,
                 optimizer=strategy_opt,
                 buffer=strategy_buffer,
@@ -719,11 +766,17 @@ def train(args):
             )
             strat_s = time.perf_counter() - strat_start
             iter_s = time.perf_counter() - iter_start
+            regret_sizes_after = [len(buf) for buf in regret_buffers]
+            strategy_size_after = len(strategy_buffer)
+            regret_added = [after - before for after, before in zip(regret_sizes_after, regret_sizes_before)]
+            strategy_added = strategy_size_after - strategy_size_before
+            adv_loss_vals = [x for x in adv_losses if not np.isnan(x)]
+            adv_loss_mean = float(np.mean(adv_loss_vals)) if adv_loss_vals else float("nan")
+            periodic_checkpoint_saved = 0
 
             if iteration % args.log_every == 0:
-                regret_sizes = [len(buf) for buf in regret_buffers]
                 print(
-                    f"iter={iteration:4d} regret_bufs={regret_sizes} "
+                    f"iter={iteration:4d} regret_bufs={regret_sizes_after} "
                     f"strategy_buf={len(strategy_buffer)} "
                     f"time_s(total={iter_s:.1f}, traversals={traversals_s:.1f}, adv={adv_s:.1f}, strategy={strat_s:.1f})"
                 )
@@ -742,9 +795,36 @@ def train(args):
                 torch.save(ckpt, periodic_path)
                 torch.save(ckpt, args.output)
                 print(f"Saved periodic checkpoint to {periodic_path} (and updated {args.output})")
+                periodic_checkpoint_saved = 1
+
+            metrics_row = {
+                "run_id": run_id,
+                "iteration": iteration,
+                "timestamp_utc": ts_utc,
+                "time_total_s": f"{iter_s:.6f}",
+                "time_traversals_s": f"{traversals_s:.6f}",
+                "time_adv_train_s": f"{adv_s:.6f}",
+                "time_strategy_train_s": f"{strat_s:.6f}",
+                "regret_samples_added_total": int(sum(regret_added)),
+                "strategy_samples_added": int(strategy_added),
+                "regret_buffer_total_size": int(sum(regret_sizes_after)),
+                "strategy_buffer_size": int(strategy_size_after),
+                "adv_loss_mean": f"{adv_loss_mean:.8f}" if not np.isnan(adv_loss_mean) else "nan",
+                "adv_steps_total": int(adv_steps_total),
+                "strategy_loss": f"{strategy_loss:.8f}" if not np.isnan(strategy_loss) else "nan",
+                "strategy_steps": int(strategy_steps),
+                "periodic_checkpoint_saved": periodic_checkpoint_saved,
+            }
+            for i in range(args.players):
+                metrics_row[f"regret_buffer_p{i}_size"] = int(regret_sizes_after[i])
+                metrics_row[f"regret_samples_added_p{i}"] = int(regret_added[i])
+                metrics_row[f"adv_loss_p{i}"] = f"{adv_losses[i]:.8f}" if not np.isnan(adv_losses[i]) else "nan"
+            metrics_writer.writerow(metrics_row)
+            metrics_fh.flush()
     finally:
         if mp_pool is not None:
             mp_pool.shutdown(wait=True)
+        metrics_fh.close()
 
     checkpoint = _build_checkpoint(
         advantage_nets=advantage_nets,
@@ -847,6 +927,12 @@ def parse_args():
         type=str,
         default="",
         help="Resume training from an existing checkpoint path",
+    )
+    parser.add_argument(
+        "--metrics-file",
+        type=str,
+        default="training_metrics.csv",
+        help="CSV file path for per-iteration training metrics",
     )
     parser.add_argument("--cpu", action="store_true", help="Force CPU training")
     return parser.parse_args()
