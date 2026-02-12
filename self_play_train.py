@@ -12,7 +12,9 @@ It auto-uses CUDA when available (e.g. RTX 3070).
 from __future__ import annotations
 
 import argparse
+import os
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Callable, List
 
@@ -180,6 +182,86 @@ class ReservoirBuffer:
     def sample(self, batch_size: int):
         idx = self.rng.integers(0, len(self.data), size=batch_size)
         return [self.data[i] for i in idx]
+
+
+class _ListBuffer:
+    """Simple append-only buffer used inside traversal worker processes."""
+
+    def __init__(self):
+        self.data = []
+
+    def add(self, item):
+        self.data.append(item)
+
+
+def _split_work(total: int, parts: int) -> List[int]:
+    parts = max(1, parts)
+    base = total // parts
+    rem = total % parts
+    chunks = [base + (1 if i < rem else 0) for i in range(parts)]
+    return [c for c in chunks if c > 0]
+
+
+def _cpu_state_dict(module: nn.Module) -> dict:
+    return {k: v.detach().cpu() for k, v in module.state_dict().items()}
+
+
+def _run_traversal_worker(
+    traverser_id: int,
+    traversals: int,
+    worker_seed: int,
+    players: int,
+    stack_low: int,
+    stack_high: int,
+    invalid_action_penalty: float,
+    bet_fractions: List[float],
+    hidden_size: int,
+    num_blocks: int,
+    dropout: float,
+    advantage_state_dicts_cpu: List[dict],
+    max_depth: int,
+):
+    # Keep each worker single-threaded to avoid oversubscription when many workers run.
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+    device = torch.device("cpu")
+    rng = np.random.default_rng(worker_seed)
+
+    abstraction = ActionAbstraction(bet_fractions=bet_fractions)
+    advantage_nets = [
+        AdvantageNet(OBS_SIZE, abstraction.n_actions, hidden_size, num_blocks, dropout).to(device)
+        for _ in range(players)
+    ]
+    for i in range(players):
+        advantage_nets[i].load_state_dict(advantage_state_dicts_cpu[i])
+        advantage_nets[i].eval()
+
+    regret_buffers = [_ListBuffer() for _ in range(players)]
+    strategy_buffer = _ListBuffer()
+
+    for _ in range(traversals):
+        env = Table(
+            n_players=players,
+            stack_low=stack_low,
+            stack_high=stack_high,
+            invalid_action_penalty=invalid_action_penalty,
+        )
+        env.seed(int(worker_seed + rng.integers(0, 1_000_000)))
+        obs = env.reset()
+        traverse_from_obs(
+            env=env,
+            obs=obs,
+            traverser_id=traverser_id,
+            abstraction=abstraction,
+            advantage_nets=advantage_nets,
+            regret_buffers=regret_buffers,
+            strategy_buffer=strategy_buffer,
+            rng=rng,
+            device=device,
+            depth_left=max_depth,
+        )
+
+    return traverser_id, regret_buffers[traverser_id].data, strategy_buffer.data
 
 
 def regret_matching(advantages: np.ndarray, valid_mask: np.ndarray, eps: float = 1e-12) -> np.ndarray:
@@ -387,30 +469,88 @@ def train(args):
             print(f"[iter {iteration}] start")
 
         traversals_start = time.perf_counter()
-        for traverser_id in range(args.players):
-            if args.log_phase_timing:
-                print(f"[iter {iteration}] traverser={traverser_id} traversals start")
-            for _ in range(args.traversals_per_player):
-                traversal_i = _ + 1
-                env = make_env()
-                obs = env.reset()
-                traverse_from_obs(
-                    env=env,
-                    obs=obs,
-                    traverser_id=traverser_id,
-                    abstraction=abstraction,
-                    advantage_nets=advantage_nets,
-                    regret_buffers=regret_buffers,
-                    strategy_buffer=strategy_buffer,
-                    rng=rng,
-                    device=device,
-                    depth_left=args.max_depth,
-                )
-                if args.log_traversal_every > 0 and (traversal_i % args.log_traversal_every == 0 or traversal_i == args.traversals_per_player):
-                    print(
-                        f"[iter {iteration}] traverser={traverser_id} "
-                        f"traversals={traversal_i}/{args.traversals_per_player}"
+        if args.num_workers > 1:
+            tasks = []
+            advantage_state_dicts_cpu = [_cpu_state_dict(net) for net in advantage_nets]
+            chunks_per_traverser = max(1, args.workers_per_traverser)
+            for traverser_id in range(args.players):
+                work_chunks = _split_work(args.traversals_per_player, chunks_per_traverser)
+                for chunk_i, chunk in enumerate(work_chunks):
+                    worker_seed = int(
+                        args.seed
+                        + iteration * 1_000_000
+                        + traverser_id * 10_000
+                        + chunk_i * 97
                     )
+                    tasks.append((traverser_id, chunk, worker_seed))
+
+            max_workers = min(args.num_workers, len(tasks))
+            if args.log_phase_timing:
+                print(
+                    f"[iter {iteration}] multiprocessing traversals start "
+                    f"(workers={max_workers}, tasks={len(tasks)})"
+                )
+
+            completed = 0
+            with ProcessPoolExecutor(max_workers=max_workers) as pool:
+                futures = []
+                for traverser_id, chunk, worker_seed in tasks:
+                    futures.append(
+                        pool.submit(
+                            _run_traversal_worker,
+                            traverser_id=traverser_id,
+                            traversals=chunk,
+                            worker_seed=worker_seed,
+                            players=args.players,
+                            stack_low=args.stack_low,
+                            stack_high=args.stack_high,
+                            invalid_action_penalty=args.invalid_action_penalty,
+                            bet_fractions=bet_fractions,
+                            hidden_size=args.hidden_size,
+                            num_blocks=args.num_blocks,
+                            dropout=args.dropout,
+                            advantage_state_dicts_cpu=advantage_state_dicts_cpu,
+                            max_depth=args.max_depth,
+                        )
+                    )
+
+                for future in as_completed(futures):
+                    traverser_id, regret_samples, strategy_samples = future.result()
+                    for sample in regret_samples:
+                        regret_buffers[traverser_id].add(sample)
+                    for sample in strategy_samples:
+                        strategy_buffer.add(sample)
+                    completed += 1
+                    if args.log_mp_every > 0 and (completed % args.log_mp_every == 0 or completed == len(futures)):
+                        print(
+                            f"[iter {iteration}] mp_tasks={completed}/{len(futures)} "
+                            f"(regret+={len(regret_samples)}, strategy+={len(strategy_samples)})"
+                        )
+        else:
+            for traverser_id in range(args.players):
+                if args.log_phase_timing:
+                    print(f"[iter {iteration}] traverser={traverser_id} traversals start")
+                for _ in range(args.traversals_per_player):
+                    traversal_i = _ + 1
+                    env = make_env()
+                    obs = env.reset()
+                    traverse_from_obs(
+                        env=env,
+                        obs=obs,
+                        traverser_id=traverser_id,
+                        abstraction=abstraction,
+                        advantage_nets=advantage_nets,
+                        regret_buffers=regret_buffers,
+                        strategy_buffer=strategy_buffer,
+                        rng=rng,
+                        device=device,
+                        depth_left=args.max_depth,
+                    )
+                    if args.log_traversal_every > 0 and (traversal_i % args.log_traversal_every == 0 or traversal_i == args.traversals_per_player):
+                        print(
+                            f"[iter {iteration}] traverser={traverser_id} "
+                            f"traversals={traversal_i}/{args.traversals_per_player}"
+                        )
         traversals_s = time.perf_counter() - traversals_start
 
         adv_start = time.perf_counter()
@@ -468,6 +608,18 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Deep CFR-style trainer for no-limit hold'em using pokerenv")
     parser.add_argument("--iterations", type=int, default=100, help="Number of CFR iterations")
     parser.add_argument("--traversals-per-player", type=int, default=100, help="Traversals per player each iteration")
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=max(1, (os.cpu_count() or 2) // 2),
+        help="Worker processes for traversal generation (1 disables multiprocessing)",
+    )
+    parser.add_argument(
+        "--workers-per-traverser",
+        type=int,
+        default=2,
+        help="How many traversal tasks to split each traverser into per iteration",
+    )
     parser.add_argument("--players", type=int, default=6, choices=[2, 3, 4, 5, 6], help="Players at the table")
     parser.add_argument("--hidden-size", type=int, default=512, help="Hidden layer width")
     parser.add_argument("--num-blocks", type=int, default=6, help="Number of residual blocks in each network")
@@ -502,6 +654,12 @@ def parse_args():
         "--log-phase-timing",
         action="store_true",
         help="Print iteration phase start markers for easier long-run monitoring",
+    )
+    parser.add_argument(
+        "--log-mp-every",
+        type=int,
+        default=2,
+        help="Print multiprocessing traversal task completion every N tasks (0 disables)",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--output", type=str, default="deep_cfr_checkpoint.pt", help="Path for the trained checkpoint")
