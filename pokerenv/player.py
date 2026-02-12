@@ -67,14 +67,15 @@ class Player:
     def bet(self, amount):
         self.has_acted = True
         self.acted_this_street = True
-        if amount == self.stack:
+        delta = max(amount - self.bet_this_street, 0)
+        if delta >= self.stack:
+            delta = self.stack
             self.all_in = True
-        amount = amount - self.bet_this_street
-        self.stack -= amount
-        self.bet_this_street += amount
-        self.money_in_pot += amount
-        self.history.append({'action': PlayerAction.BET, 'value': amount})
-        return amount
+        self.stack -= delta
+        self.bet_this_street += delta
+        self.money_in_pot += delta
+        self.history.append({'action': PlayerAction.BET, 'value': delta})
+        return delta
 
     def punish_invalid_action(self):
         self.pending_penalty += self.penalty

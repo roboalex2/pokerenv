@@ -337,7 +337,7 @@ class Table(gym.Env):
     def _history_initialize(self):
         t = time.localtime()
         self.hand_history.append("PokerStars Hand #%d: Hold'em No Limit ($%.2f/$%.2f USD) - %d/%d/%d %d:%d:%d ET" %
-                            (np.random.randint(2230397, 32303976), SB, BB, t.tm_year, t.tm_mon, t.tm_mday, t.tm_hour,
+                            (int(self.rng.integers(2230397, 32303976)), SB, BB, t.tm_year, t.tm_mon, t.tm_mday, t.tm_hour,
                              t.tm_min, t.tm_sec))
         self.hand_history.append("Table 'Wempe III' 6-max Seat #2 is the button")
         for i, player in enumerate(self.players):
@@ -461,7 +461,8 @@ class Table(gym.Env):
 
     def _get_valid_actions(self, player):
         valid_actions = [PlayerAction.CHECK, PlayerAction.FOLD, PlayerAction.BET, PlayerAction.CALL]
-        valid_bet_range = [max(self.bet_to_match + self.minimum_raise, 1), player.stack + player.bet_this_street]
+        max_total_bet = player.stack + player.bet_this_street
+        valid_bet_range = [max(self.bet_to_match + self.minimum_raise, 1), max_total_bet]
         others_active = [p for p in self.players if p.state is PlayerState.ACTIVE if not p.all_in if p is not player]
         to_call = max(self.bet_to_match - player.bet_this_street, 0)
         # No bet to call: checking is legal, calling/folding are not.
@@ -471,7 +472,7 @@ class Table(gym.Env):
         # Facing a bet: check is not legal.
         else:
             valid_actions.remove(PlayerAction.CHECK)
-        if player.stack < max(self.bet_to_match + self.minimum_raise, 1):
+        if max_total_bet < max(self.bet_to_match + self.minimum_raise, 1):
             valid_bet_range = [0, 0]
             valid_actions.remove(PlayerAction.BET)
         elif len(others_active) == 0:

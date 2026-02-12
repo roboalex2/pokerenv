@@ -544,6 +544,7 @@ def train(args):
     regret_buffers = [ReservoirBuffer(args.regret_buffer_capacity, rng) for _ in range(args.players)]
     strategy_buffer = ReservoirBuffer(args.strategy_buffer_capacity, rng)
     start_iteration = 1
+    mp_pool = None
 
     if args.resume_from:
         checkpoint = torch.load(args.resume_from, map_location=device)
@@ -575,46 +576,51 @@ def train(args):
         start_iteration = loaded_iter + 1
         print(f"Resumed from {args.resume_from} at iteration={loaded_iter}. Continuing at iteration={start_iteration}.")
 
-    for iteration in range(start_iteration, args.iterations + 1):
-        iter_start = time.perf_counter()
-        if args.log_phase_timing:
-            print(f"[iter {iteration}] start")
-
-        traversals_start = time.perf_counter()
-        use_rule_opponents = args.rule_warmup_iters > 0 and iteration <= args.rule_warmup_iters and args.rule_opp_prob > 0
-        if use_rule_opponents and args.log_phase_timing:
-            print(
-                f"[iter {iteration}] rule-opponent warmup active "
-                f"(prob={args.rule_opp_prob:.2f}, mc={args.rule_mc_samples})"
-            )
+    try:
         if args.num_workers > 1:
-            tasks = []
-            advantage_state_dicts_cpu = [_cpu_state_dict(net) for net in advantage_nets]
-            chunks_per_traverser = max(1, args.workers_per_traverser)
-            for traverser_id in range(args.players):
-                work_chunks = _split_work(args.traversals_per_player, chunks_per_traverser)
-                for chunk_i, chunk in enumerate(work_chunks):
-                    worker_seed = int(
-                        args.seed
-                        + iteration * 1_000_000
-                        + traverser_id * 10_000
-                        + chunk_i * 97
-                    )
-                    tasks.append((traverser_id, chunk, worker_seed))
+            chunks_template = _split_work(args.traversals_per_player, max(1, args.workers_per_traverser))
+            max_workers = min(args.num_workers, args.players * len(chunks_template))
+            mp_pool = ProcessPoolExecutor(max_workers=max_workers)
 
-            max_workers = min(args.num_workers, len(tasks))
+        for iteration in range(start_iteration, args.iterations + 1):
+            iter_start = time.perf_counter()
             if args.log_phase_timing:
-                print(
-                    f"[iter {iteration}] multiprocessing traversals start "
-                    f"(workers={max_workers}, tasks={len(tasks)})"
-                )
+                print(f"[iter {iteration}] start")
 
-            completed = 0
-            with ProcessPoolExecutor(max_workers=max_workers) as pool:
+            traversals_start = time.perf_counter()
+            use_rule_opponents = args.rule_warmup_iters > 0 and iteration <= args.rule_warmup_iters and args.rule_opp_prob > 0
+            if use_rule_opponents and args.log_phase_timing:
+                print(
+                    f"[iter {iteration}] rule-opponent warmup active "
+                    f"(prob={args.rule_opp_prob:.2f}, mc={args.rule_mc_samples})"
+                )
+            if args.num_workers > 1:
+                tasks = []
+                advantage_state_dicts_cpu = [_cpu_state_dict(net) for net in advantage_nets]
+                chunks_per_traverser = max(1, args.workers_per_traverser)
+                for traverser_id in range(args.players):
+                    work_chunks = _split_work(args.traversals_per_player, chunks_per_traverser)
+                    for chunk_i, chunk in enumerate(work_chunks):
+                        worker_seed = int(
+                            args.seed
+                            + iteration * 1_000_000
+                            + traverser_id * 10_000
+                            + chunk_i * 97
+                        )
+                        tasks.append((traverser_id, chunk, worker_seed))
+
+                max_workers = min(args.num_workers, len(tasks))
+                if args.log_phase_timing:
+                    print(
+                        f"[iter {iteration}] multiprocessing traversals start "
+                        f"(workers={max_workers}, tasks={len(tasks)})"
+                    )
+
+                completed = 0
                 futures = []
                 for traverser_id, chunk, worker_seed in tasks:
                     futures.append(
-                        pool.submit(
+                        mp_pool.submit(
                             _run_traversal_worker,
                             traverser_id=traverser_id,
                             traversals=chunk,
@@ -647,95 +653,98 @@ def train(args):
                             f"[iter {iteration}] mp_tasks={completed}/{len(futures)} "
                             f"(regret+={len(regret_samples)}, strategy+={len(strategy_samples)})"
                         )
-        else:
-            rule_bot = None
-            if use_rule_opponents:
-                rule_bot = RuleBasedPlayer(
-                    RuleBotConfig(
-                        monte_carlo_samples=args.rule_mc_samples,
-                        rng_seed=int(args.seed + iteration * 41),
-                    )
-                )
-            for traverser_id in range(args.players):
-                if args.log_phase_timing:
-                    print(f"[iter {iteration}] traverser={traverser_id} traversals start")
-                for _ in range(args.traversals_per_player):
-                    traversal_i = _ + 1
-                    env = make_env()
-                    obs = env.reset()
-                    traverse_from_obs(
-                        env=env,
-                        obs=obs,
-                        traverser_id=traverser_id,
-                        abstraction=abstraction,
-                        advantage_nets=advantage_nets,
-                        regret_buffers=regret_buffers,
-                        strategy_buffer=strategy_buffer,
-                        rng=rng,
-                        device=device,
-                        depth_left=args.max_depth,
-                        rule_bot=rule_bot,
-                        rule_opp_prob=args.rule_opp_prob,
-                    )
-                    if args.log_traversal_every > 0 and (traversal_i % args.log_traversal_every == 0 or traversal_i == args.traversals_per_player):
-                        print(
-                            f"[iter {iteration}] traverser={traverser_id} "
-                            f"traversals={traversal_i}/{args.traversals_per_player}"
+            else:
+                rule_bot = None
+                if use_rule_opponents:
+                    rule_bot = RuleBasedPlayer(
+                        RuleBotConfig(
+                            monte_carlo_samples=args.rule_mc_samples,
+                            rng_seed=int(args.seed + iteration * 41),
                         )
-        traversals_s = time.perf_counter() - traversals_start
+                    )
+                for traverser_id in range(args.players):
+                    if args.log_phase_timing:
+                        print(f"[iter {iteration}] traverser={traverser_id} traversals start")
+                    for _ in range(args.traversals_per_player):
+                        traversal_i = _ + 1
+                        env = make_env()
+                        obs = env.reset()
+                        traverse_from_obs(
+                            env=env,
+                            obs=obs,
+                            traverser_id=traverser_id,
+                            abstraction=abstraction,
+                            advantage_nets=advantage_nets,
+                            regret_buffers=regret_buffers,
+                            strategy_buffer=strategy_buffer,
+                            rng=rng,
+                            device=device,
+                            depth_left=args.max_depth,
+                            rule_bot=rule_bot,
+                            rule_opp_prob=args.rule_opp_prob,
+                        )
+                        if args.log_traversal_every > 0 and (traversal_i % args.log_traversal_every == 0 or traversal_i == args.traversals_per_player):
+                            print(
+                                f"[iter {iteration}] traverser={traverser_id} "
+                                f"traversals={traversal_i}/{args.traversals_per_player}"
+                            )
+            traversals_s = time.perf_counter() - traversals_start
 
-        adv_start = time.perf_counter()
-        for pid in range(args.players):
-            train_advantage_net(
-                net=advantage_nets[pid],
-                optimizer=advantage_opts[pid],
-                buffer=regret_buffers[pid],
+            adv_start = time.perf_counter()
+            for pid in range(args.players):
+                train_advantage_net(
+                    net=advantage_nets[pid],
+                    optimizer=advantage_opts[pid],
+                    buffer=regret_buffers[pid],
+                    device=device,
+                    batch_size=args.batch_size,
+                    train_steps=args.adv_train_steps,
+                    grad_clip=args.grad_clip,
+                    log_every=args.log_train_every,
+                    log_prefix=f"[iter {iteration}] [player {pid}] ",
+                )
+            adv_s = time.perf_counter() - adv_start
+
+            strat_start = time.perf_counter()
+            train_strategy_net(
+                net=strategy_net,
+                optimizer=strategy_opt,
+                buffer=strategy_buffer,
                 device=device,
                 batch_size=args.batch_size,
-                train_steps=args.adv_train_steps,
+                train_steps=args.strategy_train_steps,
                 grad_clip=args.grad_clip,
                 log_every=args.log_train_every,
-                log_prefix=f"[iter {iteration}] [player {pid}] ",
+                log_prefix=f"[iter {iteration}] ",
             )
-        adv_s = time.perf_counter() - adv_start
+            strat_s = time.perf_counter() - strat_start
+            iter_s = time.perf_counter() - iter_start
 
-        strat_start = time.perf_counter()
-        train_strategy_net(
-            net=strategy_net,
-            optimizer=strategy_opt,
-            buffer=strategy_buffer,
-            device=device,
-            batch_size=args.batch_size,
-            train_steps=args.strategy_train_steps,
-            grad_clip=args.grad_clip,
-            log_every=args.log_train_every,
-            log_prefix=f"[iter {iteration}] ",
-        )
-        strat_s = time.perf_counter() - strat_start
-        iter_s = time.perf_counter() - iter_start
+            if iteration % args.log_every == 0:
+                regret_sizes = [len(buf) for buf in regret_buffers]
+                print(
+                    f"iter={iteration:4d} regret_bufs={regret_sizes} "
+                    f"strategy_buf={len(strategy_buffer)} "
+                    f"time_s(total={iter_s:.1f}, traversals={traversals_s:.1f}, adv={adv_s:.1f}, strategy={strat_s:.1f})"
+                )
 
-        if iteration % args.log_every == 0:
-            regret_sizes = [len(buf) for buf in regret_buffers]
-            print(
-                f"iter={iteration:4d} regret_bufs={regret_sizes} "
-                f"strategy_buf={len(strategy_buffer)} "
-                f"time_s(total={iter_s:.1f}, traversals={traversals_s:.1f}, adv={adv_s:.1f}, strategy={strat_s:.1f})"
-            )
-
-        if args.save_every > 0 and iteration % args.save_every == 0:
-            ckpt = _build_checkpoint(
-                advantage_nets=advantage_nets,
-                advantage_opts=advantage_opts,
-                strategy_net=strategy_net,
-                strategy_opt=strategy_opt,
-                bet_fractions=bet_fractions,
-                args=args,
-                iteration=iteration,
-            )
-            periodic_path = _iteration_checkpoint_path(args.output, iteration)
-            torch.save(ckpt, periodic_path)
-            torch.save(ckpt, args.output)
-            print(f"Saved periodic checkpoint to {periodic_path} (and updated {args.output})")
+            if args.save_every > 0 and iteration % args.save_every == 0:
+                ckpt = _build_checkpoint(
+                    advantage_nets=advantage_nets,
+                    advantage_opts=advantage_opts,
+                    strategy_net=strategy_net,
+                    strategy_opt=strategy_opt,
+                    bet_fractions=bet_fractions,
+                    args=args,
+                    iteration=iteration,
+                )
+                periodic_path = _iteration_checkpoint_path(args.output, iteration)
+                torch.save(ckpt, periodic_path)
+                torch.save(ckpt, args.output)
+                print(f"Saved periodic checkpoint to {periodic_path} (and updated {args.output})")
+    finally:
+        if mp_pool is not None:
+            mp_pool.shutdown(wait=True)
 
     checkpoint = _build_checkpoint(
         advantage_nets=advantage_nets,
@@ -779,7 +788,7 @@ def parse_args():
     parser.add_argument("--regret-buffer-capacity", type=int, default=200000, help="Reservoir capacity per regret buffer")
     parser.add_argument("--strategy-buffer-capacity", type=int, default=500000, help="Reservoir capacity for strategy samples")
     parser.add_argument("--bet-fractions", type=str, default="0.1,0.25,0.5,0.75,1.0", help="Comma-separated bet bucket fractions in [0,1]")
-    parser.add_argument("--max-depth", type=int, default=512, help="Traversal depth cutoff")
+    parser.add_argument("--max-depth", type=int, default=256, help="Traversal depth cutoff")
     parser.add_argument("--stack-low", type=int, default=50, help="Minimum stack in big blinds")
     parser.add_argument("--stack-high", type=int, default=200, help="Maximum stack in big blinds")
     parser.add_argument("--invalid-action-penalty", type=float, default=0.01, help="Penalty for invalid actions")
