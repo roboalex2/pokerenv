@@ -1,3 +1,4 @@
+import copy
 import numpy as np
 import time
 import gym
@@ -50,6 +51,10 @@ class Table(gym.Env):
 
     def seed(self, seed=None):
         self.rng = np.random.default_rng(seed)
+
+    def clone(self):
+        """Return a deep-copied table state for game-tree traversals."""
+        return copy.deepcopy(self)
 
     def reset(self):
         self.current_turn = 0
@@ -212,7 +217,7 @@ class Table(gym.Env):
             self.street = GameState.FLOP
             transitioned = True
         if self.street == GameState.FLOP and (not transitioned or transition_to_end):
-            new = self.deck.draw(1)
+            new = self.deck.draw(1)[0]
             self.cards.append(new)
             self._write_event("*** TURN *** [%s %s %s] [%s]" %
                               (Card.int_to_str(self.cards[0]), Card.int_to_str(self.cards[1]),
@@ -220,7 +225,7 @@ class Table(gym.Env):
             self.street = GameState.TURN
             transitioned = True
         if self.street == GameState.TURN and (not transitioned or transition_to_end):
-            new = self.deck.draw(1)
+            new = self.deck.draw(1)[0]
             self.cards.append(new)
             self._write_event("*** RIVER *** [%s %s %s %s] [%s]" %
                               (Card.int_to_str(self.cards[0]), Card.int_to_str(self.cards[1]),

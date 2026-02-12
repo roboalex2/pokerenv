@@ -112,3 +112,27 @@ while True:
     iteration += 1
     table.hand_history_enabled = False
 ```
+
+## Deep CFR-style training bot (RTX 3070 ready)
+A Deep CFR-style trainer is included in `self_play_train.py`.
+
+It uses:
+- finite action abstraction via discrete bet buckets,
+- external-sampling traversals to collect regret samples,
+- per-player advantage networks trained from reservoir buffers,
+- an average strategy network trained on sampled behavior policies,
+- deeper residual MLP encoders (LayerNorm + GELU + dropout) for stronger function approximation stability.
+
+```bash
+pip install torch
+python self_play_train.py \
+  --iterations 200 \
+  --traversals-per-player 200 \
+  --bet-fractions 0.1,0.25,0.5,0.75,1.0 \
+  --output models/nlhe_deep_cfr.pt
+```
+
+Notes:
+- The script automatically uses CUDA when available, so your RTX 3070 will be used by default.
+- Use `--cpu` if you want to force CPU training.
+- The output checkpoint contains all player advantage networks and the average strategy network.
